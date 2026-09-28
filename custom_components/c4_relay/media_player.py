@@ -176,17 +176,26 @@ class RelayRoomPlayer(MediaPlayerEntity):
             await self._hub.station_call(station, "media_previous_track")
 
     async def async_set_volume_level(self, volume: float) -> None:
-        """AlexxIT syncs the station volume here ("Алиса, громче" etc.).
+        """Two callers: a person (slider, service call) and AlexxIT's sync.
 
-        The driver turns it into a room level with the room's calibration
-        (step, min, max from Composer). The first value after start-up is only a
-        baseline: AlexxIT sends the station's level as soon as it starts
-        streaming, which must not change the room.
+        A person's call (context with a user) sets the room absolutely within
+        its min..max. AlexxIT syncs the station volume here too; while our Glagol
+        hook is in place voice commands are taken from Alice's directives
+        instead, because the station volume is garbage while the station is
+        muted. Without the hook the old guessing path (/station_volume) is used.
         """
-        initial = not self._station_volume_seen
-        self._station_volume_seen = True
+        station = self._hub.station_for_room(self.room_id)
         try:
-            resp = await self._hub.client.station_volume(self.room_id, volume, initial)
+            if self._context is not None and self._context.user_id:
+                resp = await self._hub.client.volume_level(self.room_id, volume)
+            elif self._hub.hooked(station):
+                _LOGGER.debug("room %s: station volume sync %.2f ignored (directives in use)",
+                              self.room_id, volume)
+                return
+            else:
+                initial = not self._station_volume_seen
+                self._station_volume_seen = True
+                resp = await self._hub.client.station_volume(self.room_id, volume, initial)
         except RelayError as err:
             raise HomeAssistantError(f"Control4 Yandex Relay: {err}") from err
         if isinstance(resp.get("volume"), (int, float)):

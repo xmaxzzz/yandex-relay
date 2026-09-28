@@ -111,7 +111,7 @@ class Boot(unittest.TestCase):
         self.assertEqual(len(code), 8)
         self.assertEqual(d.calls("CreateServer")[0]["port"], 18765)
         self.assertIn("2: Гостиная & кухня, Спальня", d.prop("Rooms Found"))
-        self.assertEqual(d.prop("Driver Version"), "0.2.0")
+        self.assertEqual(d.prop("Driver Version"), "0.3.0")
         self.assertEqual(d.g.PERSIST["pairing_code"], code)
         self.assertEqual(d.calls("RegisterVariableListener")[0]["var"], 1009)
 
@@ -137,7 +137,7 @@ class Http(unittest.TestCase):
     def test_info(self):
         code, body = self.d.http("GET", "/info")
         self.assertEqual(code, 200)
-        self.assertEqual(body["version"], "0.2.0")
+        self.assertEqual(body["version"], "0.3.0")
         self.assertFalse(body["paired"])
 
     def test_split_packets(self):
@@ -153,7 +153,7 @@ class Http(unittest.TestCase):
         self.assertEqual(code, 200)
         self.assertEqual(self.d.prop("Paired With"), "ha:8123")
         self.assertEqual(self.d.g.PERSIST["webhook"], "http://ha:8123/api/webhook/abc")
-        self.assertEqual(self.d.webhooks("hello")[0]["driver_version"], "0.2.0")
+        self.assertEqual(self.d.webhooks("hello")[0]["driver_version"], "0.3.0")
         self.assertEqual(self.d.calls("urlPost")[0]["url"], "http://ha:8123/api/webhook/abc")
 
     def test_pair_rejects_bad_url(self):
@@ -616,6 +616,102 @@ class Volume(unittest.TestCase):
 
     def test_direct_volume_capped(self):
         self.assertEqual(self.d.http("POST", "/volume", {"room_id": 12, "level": 95})[1]["volume"], 70)
+
+
+class V030(unittest.TestCase):
+    """Volume by Alice's executed command, copyable code, pairing extras (v0.3.0)."""
+
+    def setUp(self):
+        self.d = Driver()
+        self.hook = "http://ha:8123/api/webhook/abc"
+
+    def pair(self, **extra):
+        return self.d.http("POST", "/pair", {"webhook_url": self.hook, **extra})[1]
+
+    def levels(self, room=12):
+        return [int(c["params"]["LEVEL"]) for c in self.d.calls("SendToDevice")
+                if c["id"] == room and c["cmd"] == "SET_VOLUME_LEVEL"]
+
+    def test_volume_step_from_current_level(self):
+        self.pair()
+        self.assertEqual(self.d.http("POST", "/volume_step", {"room_id": 12, "steps": 1})[1]["volume"], 45)
+        self.assertEqual(self.d.http("POST", "/volume_step", {"room_id": 12, "steps": -1})[1]["volume"], 40)
+        self.assertEqual(self.levels(), [45, 40])
+
+    def test_volume_level_maps_onto_min_max(self):
+        self.pair()
+        r = self.d.http("POST", "/volume_level", {"room_id": 12, "level": 0.5})[1]
+        self.assertEqual((r["result"], r["volume"]), ("absolute", 38))     # 5 + 0.5 * 65
+
+    def test_volume_step_while_ducked_changes_restore_level(self):
+        self.pair()
+        body = play_body()
+        self.d.http("POST", "/play", body)
+        self.d.proxy("INTERNET_RADIO_SELECTED", QUEUE_ID=501, ROOM_ID=12, QUEUE_INFO="t1")
+        self.d.http("POST", "/duck", {"room_id": 12, "active": True})
+        self.d.clear()
+        self.d.http("POST", "/volume_step", {"room_id": 12, "steps": 1})
+        self.assertEqual(self.levels(), [])
+        self.d.http("POST", "/duck", {"room_id": 12, "active": False})
+        self.assertEqual(self.levels(), [45])
+
+    def test_volume_step_needs_room_level(self):
+        self.d.g.ROOM_VARS[12] = self.d.lua.table_from({})
+        self.assertEqual(self.d.http("POST", "/volume_step", {"room_id": 12, "steps": 1})[1]["result"],
+                         "volume unknown")
+
+    def test_bad_requests(self):
+        self.assertEqual(self.d.http("POST", "/volume_step", {"room_id": 12})[0], 400)
+        self.assertEqual(self.d.http("POST", "/volume_level", {"room_id": 12})[0], 400)
+
+    def test_pairing_code_edits_are_undone(self):
+        code = self.d.prop("Pairing Code")
+        self.d.g.PROPS["Pairing Code"] = "HACKED"
+        self.d.g.OnPropertyChanged("Pairing Code")
+        self.assertEqual(self.d.prop("Pairing Code"), code)
+        self.assertEqual(self.d.http("GET", "/info")[0], 200)
+
+    def test_pairing_code_property_is_editable(self):
+        with open(os.path.join(HERE, "..", "driver.xml"), encoding="utf-8") as f:
+            xml = f.read()
+        self.assertRegex(xml, r"<name>Pairing Code</name>\s*<type>STRING</type>\s*<default></default>\s*<readonly>false</readonly>")
+
+    def test_bound_rooms_listed_first_and_persisted(self):
+        self.pair(rooms=[13])
+        lists = [c for c in self.d.calls("UpdatePropertyList") if c["name"] == "Volume: Room"]
+        self.assertEqual(lists[-1]["list"], "-,Спальня,Гостиная & кухня")
+        self.assertEqual(list(self.d.g.PERSIST["bound_rooms"].values()), [13])
+        self.d.g.OnDriverLateInit()                                  # survives restart
+        lists = [c for c in self.d.calls("UpdatePropertyList") if c["name"] == "Volume: Room"]
+        self.assertEqual(lists[-1]["list"], "-,Спальня,Гостиная & кухня")
+
+    def test_fresh_driver_takes_ha_copy_of_settings(self):
+        r = self.pair(volume_cfg={"13": {"step": 10, "max": 42, "min": 3, "duck": "Mute", "duck_level": 20}})
+        self.assertTrue(r["volume_restored"])
+        self.assertEqual(self.d.g.YANDEX_RELAY_TEST.vol_cfg(13)["max"], 42)
+        self.assertEqual(self.d.g.PERSIST["volume_cfg"]["13"]["step"], 10)
+
+    def test_existing_settings_not_overwritten_by_ha(self):
+        self.pair()
+        self.d.g.PROPS["Volume: Room"] = "Спальня"
+        self.d.g.OnPropertyChanged("Volume: Room")
+        self.d.g.PROPS["Volume: Max %"] = "55"
+        self.d.g.OnPropertyChanged("Volume: Max %")
+        r = self.pair(volume_cfg={"13": {"max": 42}})
+        self.assertFalse(r["volume_restored"])
+        self.assertEqual(self.d.g.YANDEX_RELAY_TEST.vol_cfg(13)["max"], 55)
+        self.assertEqual(r["volume_cfg"]["13"]["max"], 55)
+
+    def test_settings_change_sent_to_ha_and_summary(self):
+        self.pair(rooms=[12])
+        self.d.g.PROPS["Volume: Room"] = "Спальня"
+        self.d.g.OnPropertyChanged("Volume: Room")
+        self.d.g.PROPS["Volume: Max %"] = "50"
+        self.d.g.OnPropertyChanged("Volume: Max %")
+        ev = self.d.webhooks("volume_cfg")[-1]
+        self.assertEqual(ev["volume_cfg"]["13"]["max"], 50)
+        self.assertEqual(self.d.prop("Volume: Summary"),
+                         "Гостиная & кухня 5/70/5 Lower 30; Спальня 5/50/5 Lower 30")
 
 
 class Actions(unittest.TestCase):

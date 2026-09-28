@@ -52,6 +52,8 @@ def mock_driver(aioclient_mock, info_status: int = 200) -> None:
     aioclient_mock.post(f"{BASE}/stop", json={"room_id": 21, "state": "stopped"})
     aioclient_mock.post(f"{BASE}/station_volume", json={"room_id": 21, "result": "step", "volume": 45})
     aioclient_mock.post(f"{BASE}/duck", json={"room_id": 21, "result": "ducked", "ducked": True})
+    aioclient_mock.post(f"{BASE}/volume_step", json={"room_id": 21, "result": "step", "volume": 45})
+    aioclient_mock.post(f"{BASE}/volume_level", json={"room_id": 21, "result": "absolute", "volume": 38})
 
 
 def add_station(hass: HomeAssistant, *, area: str | None = "Офис", state: str = "playing",
@@ -157,7 +159,7 @@ async def test_setup_pairs_and_creates_entities(hass, aioclient_mock, relay) -> 
     entry, station, _ = relay
     assert entry.state is ConfigEntryState.LOADED
     pair = calls_to(aioclient_mock, "/pair")[0]
-    assert pair[2] == {"webhook_url": f"http://192.0.2.20:8123/api/webhook/{HOOK}"}
+    assert pair[2] == {"webhook_url": f"http://192.0.2.20:8123/api/webhook/{HOOK}", "rooms": [21]}
     assert pair[3]["X-Relay-Key"] == "ABCD1234"
     st = hass.states.get(player_id(hass, entry))
     assert st.name == "Control4 Офис" and st.state == "idle"
@@ -349,3 +351,116 @@ async def test_glagol_hook_survives_missing_alexxit(hass, relay) -> None:
     entry, _, _ = relay
     with patch.object(entry.runtime_data, "_station_entity", return_value=None):
         entry.runtime_data.hook_stations()           # only a warning, no exception
+
+
+# --- volume by Alice's directives (0.3.0) -----------------------------------------
+
+def hook_fake_station(hub):
+    from types import SimpleNamespace
+    seen = []
+    glagol = SimpleNamespace(update_handler=lambda data: seen.append(data))
+    fake = SimpleNamespace(glagol=glagol)
+    patcher = patch.object(hub, "_station_entity", return_value=fake)
+    patcher.start()
+    hub.hook_stations()
+    return glagol, seen, patcher
+
+
+def set_level_msg(level, volume=0.0):
+    return {"state": {"aliceState": "IDLE", "volume": volume, "playing": True},
+            "vinsResponse": {"response": {"directives": [
+                {"name": "sound_set_level", "payload": {"new_level": level, "new_percent_level": level * 10}},
+                {"name": "tts_play_placeholder", "payload": {"channel": "Dialog"}}]}}}
+
+
+async def test_louder_on_muted_station_steps_room(hass, aioclient_mock, relay) -> None:
+    entry, station, _ = relay
+    set_station(hass, station, source="Control4 Офис", source_list=["Станция", "Control4 Офис"])
+    glagol, seen, patcher = hook_fake_station(entry.runtime_data)
+    try:
+        glagol.update_handler({"state": {"aliceState": "IDLE", "volume": 0.0, "playing": True}})
+        glagol.update_handler(set_level_msg(1))           # "громче" on the muted station
+        glagol.update_handler(set_level_msg(0))           # "тише"
+        await hass.async_block_till_done()
+    finally:
+        patcher.stop()
+    assert [c[2] for c in calls_to(aioclient_mock, "/volume_step")] == [
+        {"room_id": 21, "steps": 1}, {"room_id": 21, "steps": -1}]
+    assert len(seen) == 3                                   # AlexxIT got all messages
+    assert hass.states.get(player_id(hass, entry)).attributes["volume_level"] == 0.45
+
+
+async def test_absolute_level_and_unmuted_station(hass, aioclient_mock, relay) -> None:
+    entry, station, _ = relay
+    set_station(hass, station, source="Control4 Офис", source_list=["Станция", "Control4 Офис"])
+    glagol, _, patcher = hook_fake_station(entry.runtime_data)
+    try:
+        glagol.update_handler({"state": {"volume": 0.0}})
+        glagol.update_handler(set_level_msg(5))            # "громкость 5"
+        glagol.update_handler({"state": {"volume": 0.4}})  # station not muted
+        glagol.update_handler(set_level_msg(5, volume=0.4))
+        await hass.async_block_till_done()
+    finally:
+        patcher.stop()
+    assert [c[2] for c in calls_to(aioclient_mock, "/volume_level")] == [{"room_id": 21, "level": 0.5}]
+    assert [c[2] for c in calls_to(aioclient_mock, "/volume_step")] == [{"room_id": 21, "steps": 1}]
+
+
+async def test_directives_ignored_when_not_streaming(hass, aioclient_mock, relay) -> None:
+    entry, station, _ = relay
+    set_station(hass, station, source="Станция", source_list=["Станция", "Control4 Офис"])
+    glagol, _, patcher = hook_fake_station(entry.runtime_data)
+    try:
+        glagol.update_handler(set_level_msg(1))
+        await hass.async_block_till_done()
+    finally:
+        patcher.stop()
+    assert calls_to(aioclient_mock, "/volume_step") == []
+
+
+async def test_alexxit_volume_sync_ignored_while_hooked(hass, aioclient_mock, relay) -> None:
+    entry, _, _ = relay
+    _, _, patcher = hook_fake_station(entry.runtime_data)
+    try:
+        await hass.services.async_call("media_player", "volume_set",
+                                       {"entity_id": player_id(hass, entry), "volume_level": 0.1},
+                                       blocking=True)
+    finally:
+        patcher.stop()
+    assert calls_to(aioclient_mock, "/station_volume") == []
+    assert calls_to(aioclient_mock, "/volume_level") == []
+
+
+async def test_user_slider_sets_room_level(hass, aioclient_mock, relay, hass_admin_user) -> None:
+    from homeassistant.core import Context
+    entry, _, _ = relay
+    await hass.services.async_call("media_player", "volume_set",
+                                   {"entity_id": player_id(hass, entry), "volume_level": 0.5},
+                                   blocking=True, context=Context(user_id=hass_admin_user.id))
+    assert [c[2] for c in calls_to(aioclient_mock, "/volume_level")] == [{"room_id": 21, "level": 0.5}]
+
+
+async def test_volume_settings_backed_up_and_sent_on_pairing(hass, aioclient_mock, hass_client_no_auth) -> None:
+    from pytest_homeassistant_custom_component.common import MockConfigEntry as MCE
+    mock_driver(aioclient_mock)
+    station = add_station(hass)
+    entry = MCE(domain=DOMAIN, unique_id=f"{HOST}:{PORT}", title="Control4",
+                data={"host": HOST, "port": PORT, CONF_PAIRING_CODE: "ABCD1234",
+                      CONF_HA_URL: "http://192.0.2.20:8123", CONF_WEBHOOK_ID: HOOK},
+                options={CONF_BINDINGS: {station: 21}})
+    entry.add_to_hass(hass)
+    assert await hass.config_entries.async_setup(entry.entry_id)
+    await hass.async_block_till_done()
+    cfg = {"21": {"step": 10, "max": 50, "min": 5, "duck": "Lower", "duck_level": 30}}
+    client = await hass_client_no_auth()
+    await client.post(f"/api/webhook/{HOOK}", json={"event": "volume_cfg", "volume_cfg": cfg})
+    await hass.async_block_till_done()
+    assert entry.runtime_data.volume_cfg == cfg
+    # re-pairing (e.g. the driver was re-added) sends the copy back
+    aioclient_mock.clear_requests()
+    mock_driver(aioclient_mock)
+    await hass.config_entries.async_reload(entry.entry_id)
+    await hass.async_block_till_done()
+    assert calls_to(aioclient_mock, "/pair")[0][2]["volume_cfg"] == cfg
+    await hass.config_entries.async_unload(entry.entry_id)
+    await hass.async_block_till_done()

@@ -22,6 +22,7 @@ from homeassistant.const import CONF_HOST, CONF_PORT, EVENT_HOMEASSISTANT_STARTE
 from homeassistant.core import CoreState, Event, HomeAssistant, callback
 from homeassistant.exceptions import ConfigEntryAuthFailed, ConfigEntryNotReady
 from homeassistant.helpers.aiohttp_client import async_get_clientsession
+from homeassistant.helpers.storage import Store
 from homeassistant.helpers.event import (
     async_call_later,
     async_track_state_change_event,
@@ -38,7 +39,12 @@ from .const import (
     SOURCE_STATION,
     YANDEX_DOMAIN,
 )
-from .helpers import extract_directives, room_stop_pauses_station, station_calls_for_transport
+from .helpers import (
+    classify_volume_directives,
+    extract_directives,
+    room_stop_pauses_station,
+    station_calls_for_transport,
+)
 
 if TYPE_CHECKING:
     from .media_player import RelayRoomPlayer
@@ -70,6 +76,10 @@ class RelayHub:
         self._yandex_reloaded = False
         self._last_diag: dict[str, tuple] = {}
         self._hook_failed: set[str] = set()
+        self._station_volume: dict[str, float] = {}   # last volume seen in Glagol state
+        # HA's copy of the driver's per-room volume settings (restored on re-add).
+        self.store: Store = Store(hass, 1, f"{DOMAIN}.{entry.entry_id}")
+        self.volume_cfg: dict = {}
 
     # --- bindings ---------------------------------------------------------
     def station_for_room(self, room_id: int | None) -> str | None:
@@ -127,25 +137,68 @@ class RelayHub:
             wrapper._c4_relay_hook = True
             glagol.update_handler = wrapper
             self._hook_failed.discard(station)
-            _LOGGER.warning("c4_relay diagnostic: watching Glagol messages of %s", station)
+            _LOGGER.info("Watching Glagol messages of %s for volume commands", station)
+
+    def hooked(self, station: str | None) -> bool:
+        """True while our wrapper sits in the station's Glagol handler."""
+        if not station:
+            return False
+        glagol = getattr(self._station_entity(station), "glagol", None)
+        return bool(getattr(getattr(glagol, "update_handler", None), "_c4_relay_hook", False))
+
+    def streaming(self, station: str) -> bool:
+        """The station is currently pointed at its Control4 room."""
+        room = self.bindings.get(station)
+        player = self.players.get(room) if room is not None else None
+        st = self.hass.states.get(station)
+        return (player is not None and st is not None and self.enabled(station)
+                and st.attributes.get("source") == player.name)
+
+    async def apply_volume_command(self, station: str, kind: str, value: float) -> None:
+        room = self.bindings.get(station)
+        try:
+            if kind == "step":
+                resp = await self.client.volume_step(room, int(value))
+            else:
+                resp = await self.client.volume_level(room, value)
+        except RelayError as err:
+            _LOGGER.warning("volume %s %s for room %s failed: %s", kind, value, room, err)
+            return
+        _LOGGER.debug("volume %s %s -> room %s: %s", kind, value, room, resp)
+        if room in self.players and isinstance(resp.get("volume"), (int, float)):
+            self.players[room].set_room_volume(resp["volume"])
 
     @callback
     def on_glagol_message(self, station: str, data: Any) -> None:
+        """Voice volume commands: act on what Alice executed, not on the number.
+
+        The directive usually arrives before the station reports its new
+        volume, so the level seen before this message is the "before" value.
+        """
         if not isinstance(data, dict):
             return
         state = data.get("state") or {}
         key = (state.get("aliceState"), state.get("volume"), state.get("playing"))
         if self._last_diag.get(station) != key:
             self._last_diag[station] = key
-            _LOGGER.warning("c4_relay diagnostic: %s aliceState=%s volume=%s playing=%s",
-                            station, *key)
+            _LOGGER.debug("%s aliceState=%s volume=%s playing=%s", station, *key)
+        before = self._station_volume.get(station)
         vins = data.get("vinsResponse")
         if vins:
             directives = extract_directives(vins)
-            _LOGGER.warning("c4_relay diagnostic: %s directives=%s vinsResponse=%s", station,
-                            json.dumps(directives, ensure_ascii=False),
-                            json.dumps(vins, ensure_ascii=False)[:3000])
+            _LOGGER.debug("%s directives=%s", station, json.dumps(directives, ensure_ascii=False))
             self.hass.bus.async_fire(EVENT_VINS, {"entity_id": station, "directives": directives})
+            command = classify_volume_directives(directives, before)
+            if command and self.streaming(station):
+                _LOGGER.debug("%s: volume command %s (station was %s)", station, command, before)
+                self.hass.async_create_task(self.apply_volume_command(station, *command))
+        if isinstance(state.get("volume"), (int, float)):
+            self._station_volume[station] = float(state["volume"])
+
+    async def save_volume_cfg(self, cfg: dict) -> None:
+        if cfg and cfg != self.volume_cfg:
+            self.volume_cfg = cfg
+            await self.store.async_save({"volume_cfg": cfg})
 
     async def ensure_sources(self) -> None:
         """Point every enabled, bound station at its room player.
@@ -196,6 +249,9 @@ class RelayHub:
         elif event == "volume" and room in self.players:
             self.players[room].set_room_volume(evt.get("level"))
             return
+        elif event == "volume_cfg" and isinstance(evt.get("volume_cfg"), dict):
+            await self.save_volume_cfg(evt["volume_cfg"])
+            return
 
         station = self.station_for_room(room)
         if station is None or not self.enabled(station):
@@ -239,11 +295,18 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
                            local_only=True, allowed_methods=["POST"])
     entry.async_on_unload(lambda: webhook.async_unregister(hass, webhook_id))
 
+    stored = await hub.store.async_load() or {}
+    hub.volume_cfg = stored.get("volume_cfg") or {}
+
     webhook_url = entry.data[CONF_HA_URL].rstrip("/") + webhook.async_generate_path(webhook_id)
     try:
-        await client.pair(webhook_url)
+        paired = await client.pair(webhook_url, sorted(set(hub.bindings.values())), hub.volume_cfg)
     except RelayError as err:
         raise ConfigEntryNotReady(f"pairing failed: {err}") from err
+    if paired.get("volume_restored"):
+        _LOGGER.info("Volume settings restored into the Control4 driver")
+    if isinstance(paired.get("volume_cfg"), dict):
+        await hub.save_volume_cfg(paired["volume_cfg"])
 
     await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)
 
@@ -298,3 +361,7 @@ async def _options_updated(hass: HomeAssistant, entry: ConfigEntry) -> None:
 
 async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     return await hass.config_entries.async_unload_platforms(entry, PLATFORMS)
+
+
+async def async_remove_entry(hass: HomeAssistant, entry: ConfigEntry) -> None:
+    await Store(hass, 1, f"{DOMAIN}.{entry.entry_id}").async_remove()

@@ -81,3 +81,22 @@ def test_extract_directives_anywhere():
     assert sorted(names) == ["sound_louder", "sound_set_level"]
     assert helpers.extract_directives({"response": {"card": {}}}) == []
     assert helpers.extract_directives(None) == []
+
+
+
+@pytest.mark.parametrize("directives,before,expected", [
+    ([{"name": "sound_set_level", "payload": {"new_level": 1}}], 0.0, ("step", 1)),     # "громче", muted
+    ([{"name": "sound_set_level", "payload": {"new_level": 0}}], 0.0, ("step", -1)),    # "тише", muted
+    ([{"name": "sound_set_level", "payload": {"new_level": 5}}], 0.0, ("absolute", 0.5)),
+    ([{"name": "sound_set_level", "payload": {"new_level": 1}}], None, ("step", 1)),
+    ([{"name": "sound_set_level", "payload": {"new_level": 5}}], 0.4, ("step", 1)),     # unmuted 4 -> 5
+    ([{"name": "sound_set_level", "payload": {"new_level": 3}}], 0.4, ("step", -1)),
+    ([{"name": "sound_set_level", "payload": {"new_level": 8}}], 0.4, ("absolute", 0.8)),
+    ([{"name": "sound_set_level", "payload": {"new_percent_level": 70}}], 0.0, ("absolute", 0.7)),
+    ([{"name": "sound_louder"}], 0.5, ("step", 1)),
+    ([{"name": "sound_quiter"}], 0.5, ("step", -1)),
+    ([{"name": "tts_play_placeholder", "payload": {}}, {"name": "audio_play"}], 0.0, None),
+    ([], 0.0, None),
+])
+def test_classify_volume_directives(directives, before, expected):
+    assert helpers.classify_volume_directives(directives, before) == expected

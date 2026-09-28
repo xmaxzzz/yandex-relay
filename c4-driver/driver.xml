@@ -6,8 +6,8 @@
   <name>Yandex Relay</name>
   <model>Yandex Relay</model>
   <created>09/28/2026 00:00</created>
-  <modified>09/28/2026 21:26</modified>
-  <version>10</version>
+  <modified>09/28/2026 23:21</modified>
+  <version>11</version>
   <control>lua_gen</control>
   <controlmethod>IP</controlmethod>
   <driver>DriverWorks</driver>
@@ -30,7 +30,7 @@
         <name>Pairing Code</name>
         <type>STRING</type>
         <default></default>
-        <readonly>true</readonly>
+        <readonly>false</readonly>
       </property>
       <property>
         <name>Paired With</name>
@@ -58,6 +58,12 @@
         </items>
         <default>-</default>
         <readonly>false</readonly>
+      </property>
+      <property>
+        <name>Volume: Summary</name>
+        <type>STRING</type>
+        <default></default>
+        <readonly>true</readonly>
       </property>
       <property>
         <name>Volume: Current</name>
@@ -121,7 +127,7 @@
       <property>
         <name>Driver Version</name>
         <type>STRING</type>
-        <default>0.2.0</default>
+        <default>0.3.0</default>
         <readonly>true</readonly>
       </property>
     </properties>

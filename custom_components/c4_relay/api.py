@@ -50,8 +50,12 @@ class RelayClient:
     async def rooms(self) -> list[dict[str, Any]]:
         return (await self._request("GET", "/rooms")).get("rooms", [])
 
-    async def pair(self, webhook_url: str) -> dict[str, Any]:
-        return await self._request("POST", "/pair", {"webhook_url": webhook_url})
+    async def pair(self, webhook_url: str, rooms: list[int] | None = None,
+                   volume_cfg: dict | None = None) -> dict[str, Any]:
+        body: dict[str, Any] = {"webhook_url": webhook_url, "rooms": rooms or []}
+        if volume_cfg:
+            body["volume_cfg"] = volume_cfg
+        return await self._request("POST", "/pair", body)
 
     async def play(self, payload: dict[str, Any]) -> dict[str, Any]:
         return await self._request("POST", "/play", payload)
@@ -71,6 +75,12 @@ class RelayClient:
     async def station_volume(self, room_id: int, level: float, initial: bool) -> dict[str, Any]:
         return await self._request("POST", "/station_volume",
                                    {"room_id": room_id, "level": level, "initial": initial})
+
+    async def volume_step(self, room_id: int, steps: int) -> dict[str, Any]:
+        return await self._request("POST", "/volume_step", {"room_id": room_id, "steps": steps})
+
+    async def volume_level(self, room_id: int, level: float) -> dict[str, Any]:
+        return await self._request("POST", "/volume_level", {"room_id": room_id, "level": level})
 
     async def duck(self, room_id: int, active: bool) -> dict[str, Any]:
         return await self._request("POST", "/duck", {"room_id": room_id, "active": active})

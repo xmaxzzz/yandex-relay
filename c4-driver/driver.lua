@@ -1,5 +1,5 @@
 -- ============================================================
--- Yandex Relay  Control4 Driver  v0.2.0
+-- Yandex Relay  Control4 Driver  v0.3.0
 --
 -- Plays the music a Yandex Station has started into the Control4 room the
 -- station is bound to. The station stays the queue master (via AlexxIT
@@ -9,6 +9,15 @@
 -- Design, protocol and stages: docs/DESIGN.md in the yandex-relay repo.
 --
 -- Changelog:
+--   v0.3.0 - /volume_step and /volume_level: c4_relay now sends the volume
+--            command Alice actually executed (Glagol sound_set_level), since
+--            the synced station volume is unreliable while the station is
+--            muted (site 2026-09-28). /station_volume kept as a fallback.
+--            Pairing Code editable so it can be copied (edits are undone).
+--            /pair takes the rooms bound in HA (listed first in
+--            "Volume: Room") and HA's copy of the volume settings (restored
+--            into a re-added driver); every settings change is sent to HA.
+--            "Volume: Summary" shows all relevant rooms.
 --   v0.2.0 - Volume. HA reports the station volume (/station_volume) and
 --            Alice's listening state (/duck); the driver maps them onto the
 --            room: one Alice step moves the room by a per-room step from its
@@ -51,7 +60,7 @@
 --            selection events pushed to the Home Assistant webhook.
 -- ============================================================
 
-local DRIVER_VERSION  = "0.2.0"
+local DRIVER_VERSION  = "0.3.0"
 local PROXY           = 5001
 local DIGITAL_AUDIO   = 100002   -- Digital Audio device (same id TuneIn watches)
 local DA_ROOM_MAP_VAR = 1009     -- its room<->queue map variable (XML)
@@ -734,9 +743,14 @@ local function VolCfg(roomId)
     }
 end
 
+local UpdateVolumeSummary   -- below
+
 local function SaveVolCfg(roomId, cfg)
     gVolCfg[tostring(roomId)] = cfg
     C4:PersistSetValue("volume_cfg", gVolCfg)
+    -- HA keeps a copy and hands it back when the driver is re-added.
+    Webhook({ event = "volume_cfg", volume_cfg = gVolCfg })
+    if UpdateVolumeSummary then UpdateVolumeSummary() end
 end
 
 local function VolState(roomId)
@@ -807,28 +821,49 @@ OnRoomVolumeVariableRef = function(idDevice, idVariable, value)
     if v and v.var and v.var == idVariable then OnRoomVolumeVariable(idDevice, value) end
 end
 
-local function StationVolume(roomId, level, initial)
+-- Clamp to the room's min..max and apply; while ducked the level is kept for
+-- the moment the duck is lifted.
+local function ApplyRoomTarget(roomId, target)
+    local v, cfg = VolState(roomId), VolCfg(roomId)
+    target = Clamp(Round(target), cfg.min, cfg.max)
+    if v.ducked then
+        v.saved = target
+    else
+        SetRoomVolume(roomId, target)
+    end
+    return target
+end
+
+-- "Алиса, громче/тише": steps of the room's Step % from its current level.
+local function VolumeStep(roomId, steps)
     local v, cfg = WatchRoomVolume(roomId), VolCfg(roomId)
+    local base = v.ducked and v.saved or v.cur
+    if not base then return "volume unknown", nil end
+    return "step", ApplyRoomTarget(roomId, base + (tonumber(steps) or 0) * cfg.step)
+end
+
+-- "Алиса, громкость 5": 0..1 onto the room's min..max.
+local function VolumeLevel(roomId, level)
+    local cfg = VolCfg(roomId)
+    WatchRoomVolume(roomId)
+    level = Clamp(tonumber(level) or 0, 0, 1)
+    return "absolute", ApplyRoomTarget(roomId, cfg.min + level * (cfg.max - cfg.min))
+end
+
+-- Fallback path (c4_relay without the Glagol hook): guess the command from the
+-- station volume AlexxIT syncs. Unreliable while the station is muted.
+local function StationVolume(roomId, level, initial)
+    local v = WatchRoomVolume(roomId)
     level = Clamp(tonumber(level) or 0, 0, 1)
     local prev = v.prev_station
     v.prev_station = level
     if initial or prev == nil then return "recorded", nil end
     local d = level - prev
     if math.abs(d) < 0.005 then return "unchanged", nil end
-    local base = v.ducked and v.saved or v.cur
-    local target, how
-    if math.abs(d) <= 0.15 and base then
-        target, how = base + (d > 0 and cfg.step or -cfg.step), "step"
-    else
-        target, how = cfg.min + level * (cfg.max - cfg.min), "absolute"
+    if math.abs(d) <= 0.15 and (v.ducked and v.saved or v.cur) then
+        return VolumeStep(roomId, d > 0 and 1 or -1)
     end
-    target = Clamp(Round(target), cfg.min, cfg.max)
-    if v.ducked then
-        v.saved = target        -- applied when the duck is lifted
-    else
-        SetRoomVolume(roomId, target)
-    end
-    return how, target
+    return VolumeLevel(roomId, level)
 end
 
 local function Unduck(roomId)
@@ -880,9 +915,50 @@ local function LoadVolumeProps(roomId)
     ShowCurrentVolume(roomId)
 end
 
+local function RoomName(roomId)
+    for _, r in ipairs(gProjectRooms) do
+        if r.id == roomId then return r.name end
+    end
+    return "Room " .. tostring(roomId)
+end
+
+-- One line for all rooms that matter: bound in HA or with own settings.
+UpdateVolumeSummary = function()
+    local ids, seen = {}, {}
+    for _, id in ipairs(gPairing.rooms or {}) do
+        id = tonumber(id)
+        if id and not seen[id] then seen[id] = true; ids[#ids + 1] = id end
+    end
+    for key in pairs(gVolCfg) do
+        local id = tonumber(key)
+        if id and not seen[id] then seen[id] = true; ids[#ids + 1] = id end
+    end
+    local parts = {}
+    for _, id in ipairs(ids) do
+        local c = VolCfg(id)
+        parts[#parts + 1] = string.format("%s %d/%d/%d %s %d", RoomName(id), c.step, c.max, c.min,
+            c.duck, c.duck_level)
+    end
+    C4:UpdateProperty("Volume: Summary", #parts > 0 and table.concat(parts, "; ") or "defaults 5/70/5 Lower 30")
+end
+
 UpdateVolumeRoomList = function(rooms)
     gVolRoomByName = {}
     local names, selectedName = {}, nil
+    -- Rooms bound in HA first, then rooms Relay already played in, then the rest.
+    local rank = {}
+    for _, id in ipairs(gPairing.rooms or {}) do rank[tonumber(id) or -1] = 1 end
+    for id, r in pairs(gRooms) do
+        if r.track and not rank[id] then rank[id] = 2 end
+    end
+    local ordered = {}
+    for i, r in ipairs(rooms) do ordered[i] = { r = r, rank = rank[r.id] or 3, i = i } end
+    table.sort(ordered, function(a, b)
+        if a.rank ~= b.rank then return a.rank < b.rank end
+        return a.i < b.i
+    end)
+    rooms = {}
+    for i, o in ipairs(ordered) do rooms[i] = o.r end
     for _, r in ipairs(rooms) do
         local name = tostring(r.name):gsub(",", " ")
         if gVolRoomByName[name] then name = name .. " (" .. r.id .. ")" end
@@ -894,6 +970,7 @@ UpdateVolumeRoomList = function(rooms)
     C4:UpdatePropertyList("Volume: Room",
         VOL_NO_ROOM .. (#names > 0 and ("," .. table.concat(names, ",")) or ""),
         selectedName or VOL_NO_ROOM)
+    UpdateVolumeSummary()
 end
 
 local VOL_FIELDS = {
@@ -977,9 +1054,29 @@ API["POST /pair"] = function(req, b)
     gPairing.webhook = wh
     C4:PersistSetValue("webhook", wh, true)
     C4:UpdateProperty("Paired With", HostOf(wh))
+    -- Rooms bound in HA: listed first in "Volume: Room".
+    if type(b.rooms) == "table" then
+        local ids = {}
+        for _, id in ipairs(b.rooms) do if tonumber(id) then ids[#ids + 1] = tonumber(id) end end
+        gPairing.rooms = ids
+        C4:PersistSetValue("bound_rooms", ids)
+    end
+    -- A fresh (re-added) driver has no volume settings: take HA's copy.
+    local restored = false
+    if next(gVolCfg) == nil and type(b.volume_cfg) == "table" then
+        for key, c in pairs(b.volume_cfg) do
+            if tonumber(key) and type(c) == "table" then gVolCfg[tostring(key)] = c; restored = true end
+        end
+        if restored then
+            C4:PersistSetValue("volume_cfg", gVolCfg)
+            LogI("volume settings restored from Home Assistant")
+        end
+    end
+    UpdateVolumeRoomList(gProjectRooms)
+    if gVolSelected then LoadVolumeProps(gVolSelected) end
     LogI("paired with " .. HostOf(wh))
     Webhook({ event = "hello" })
-    return 200, { ok = true, version = DRIVER_VERSION }
+    return 200, { ok = true, version = DRIVER_VERSION, volume_cfg = gVolCfg, volume_restored = restored }
 end
 
 API["GET /rooms"] = function(req)
@@ -1028,6 +1125,20 @@ API["POST /station_volume"] = function(req, b)
     if not r or b.level == nil then return 400, { error = "room_id and level required" } end
     local how, target = StationVolume(r.id, b.level, b.initial == true)
     return 200, { room_id = r.id, result = how, volume = target or VolState(r.id).cur }
+end
+
+API["POST /volume_step"] = function(req, b)
+    local r = GetRoom(b.room_id)
+    if not r or tonumber(b.steps) == nil then return 400, { error = "room_id and steps required" } end
+    local how, target = VolumeStep(r.id, b.steps)
+    return 200, { room_id = r.id, result = how, volume = target or VolState(r.id).cur }
+end
+
+API["POST /volume_level"] = function(req, b)
+    local r = GetRoom(b.room_id)
+    if not r or tonumber(b.level) == nil then return 400, { error = "room_id and level required" } end
+    local how, target = VolumeLevel(r.id, b.level)
+    return 200, { room_id = r.id, result = how, volume = target }
 end
 
 API["POST /duck"] = function(req, b)
@@ -1433,6 +1544,14 @@ end
 
 function OnPropertyChanged(name)
     if name == "Bridge Port" then StartServer(); return end
+    if name == "Pairing Code" then
+        -- Editable only so Composer lets you select and copy it; edits are undone.
+        if Properties["Pairing Code"] ~= gPairing.code then
+            C4:UpdateProperty("Pairing Code", gPairing.code or "")
+            LogI("Pairing Code is changed only by the \"Regenerate Pairing Code\" action")
+        end
+        return
+    end
     OnVolumeProperty(name)
 end
 
@@ -1453,6 +1572,8 @@ function OnDriverLateInit()
 
     local vc = C4:PersistGetValue("volume_cfg")
     gVolCfg = type(vc) == "table" and vc or {}
+    local br = C4:PersistGetValue("bound_rooms")
+    gPairing.rooms = type(br) == "table" and br or {}
 
     C4:SendToProxy(PROXY, "ENABLE_DRIVER", {}, "COMMAND")
     OnRoomMap(C4:GetVariable(DIGITAL_AUDIO, DA_ROOM_MAP_VAR))

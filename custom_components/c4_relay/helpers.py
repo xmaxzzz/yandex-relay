@@ -122,6 +122,43 @@ def extract_directives(vins: object) -> list[dict]:
     return found
 
 
+def classify_volume_directives(directives: list[dict], before: float | None) -> tuple[str, float] | None:
+    """What a voice volume command meant, from the VINS directive Alice sent.
+
+    Alice turns "громче"/"тише" into an absolute sound_set_level computed from
+    the station's own volume. While AlexxIT streams, the station is muted (0),
+    so "громче" arrives as level 1 and "тише" as 0 (site log 2026-09-28):
+      * before is 0 (or unknown): level 1 -> step up, 0 -> step down, else absolute;
+      * station not muted: +-1 from its level -> step, anything else absolute.
+    Explicit "громкость 1"/"громкость 0" on a muted station read as a step.
+    Returns ("step", +1|-1) or ("absolute", 0..1), None if not a volume command.
+    """
+    for d in directives:
+        name, payload = d.get("name"), d.get("payload") or {}
+        if name == "sound_louder":
+            return ("step", 1)
+        if name == "sound_quiter":
+            return ("step", -1)
+        if name != "sound_set_level":
+            continue
+        new = payload.get("new_level")
+        if new is None and payload.get("new_percent_level") is not None:
+            new = round(float(payload["new_percent_level"]) / 10)
+        if new is None:
+            return None
+        new = int(round(float(new)))
+        prev = None if before is None else int(round(float(before) * 10))
+        if not prev:
+            if new == 1:
+                return ("step", 1)
+            if new == 0:
+                return ("step", -1)
+        elif new - prev in (1, -1):
+            return ("step", new - prev)
+        return ("absolute", max(0.0, min(1.0, new / 10)))
+    return None
+
+
 def room_stop_pauses_station(event: str, state: str | None) -> bool:
     """Whether a driver event means the room stopped playing for the user.
 
