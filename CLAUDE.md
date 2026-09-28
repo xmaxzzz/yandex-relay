@@ -14,7 +14,7 @@
 - `c4-driver/` — драйвер Yandex Relay: `driver.lua`, `driver.xml`, `www/icons/`, `build.py`, `tests/` (LuaJIT + заглушки C4).
 - `tools/relayctl.py` — управление драйвером напрямую, без HA (проверка на объекте).
 - `custom_components/c4_relay/` — интеграция HA (в корне, как требует HACS); `hacs.json`; `ha/tests/` — её тесты (чистые функции + ядро HA с моком драйвера).
-- `docs/DESIGN.md` — дизайн и решения.
+- `docs/DESIGN.md` — дизайн и решения; `docs/TODO.md` — задачи следующих версий.
 - Референсы (только читать, не менять): `D:\CLAUDE\yandex_music_driver` (SELECT_INTERNET_RADIO, now playing), `D:\CLAUDE\tunein_extracted` (очереди по `QUEUE_ID`).
 
 ## Правила работы с проектом
