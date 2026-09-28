@@ -111,7 +111,7 @@ class Boot(unittest.TestCase):
         self.assertEqual(len(code), 8)
         self.assertEqual(d.calls("CreateServer")[0]["port"], 18765)
         self.assertIn("2: Гостиная & кухня, Спальня", d.prop("Rooms Found"))
-        self.assertEqual(d.prop("Driver Version"), "0.1.7")
+        self.assertEqual(d.prop("Driver Version"), "0.2.0")
         self.assertEqual(d.g.PERSIST["pairing_code"], code)
         self.assertEqual(d.calls("RegisterVariableListener")[0]["var"], 1009)
 
@@ -137,7 +137,7 @@ class Http(unittest.TestCase):
     def test_info(self):
         code, body = self.d.http("GET", "/info")
         self.assertEqual(code, 200)
-        self.assertEqual(body["version"], "0.1.7")
+        self.assertEqual(body["version"], "0.2.0")
         self.assertFalse(body["paired"])
 
     def test_split_packets(self):
@@ -153,7 +153,7 @@ class Http(unittest.TestCase):
         self.assertEqual(code, 200)
         self.assertEqual(self.d.prop("Paired With"), "ha:8123")
         self.assertEqual(self.d.g.PERSIST["webhook"], "http://ha:8123/api/webhook/abc")
-        self.assertEqual(self.d.webhooks("hello")[0]["driver_version"], "0.1.7")
+        self.assertEqual(self.d.webhooks("hello")[0]["driver_version"], "0.2.0")
         self.assertEqual(self.d.calls("urlPost")[0]["url"], "http://ha:8123/api/webhook/abc")
 
     def test_pair_rejects_bad_url(self):
@@ -452,6 +452,170 @@ class Playback(unittest.TestCase):
     def test_selected_event(self):
         self.d.proxy("DEVICE_SELECTED", idRoom=12)
         self.assertEqual(self.d.webhooks("selected")[0]["room_id"], 12)
+
+
+class Volume(unittest.TestCase):
+    """Station volume -> room volume, ducking, per-room calibration (v0.2.0)."""
+
+    def setUp(self):
+        self.d = Driver()
+        self.d.http("POST", "/pair", {"webhook_url": "http://ha:8123/api/webhook/abc"})
+        self.d.set_time(1000)
+
+    def play(self, room=12):
+        body = play_body()
+        body["room_id"] = room
+        self.d.http("POST", "/play", body)
+        self.d.proxy("INTERNET_RADIO_SELECTED", QUEUE_ID=500 + room, ROOM_ID=room, QUEUE_INFO="t1")
+        self.d.clear()
+
+    def sv(self, level, room=12, initial=False):
+        return self.d.http("POST", "/station_volume", {"room_id": room, "level": level, "initial": initial})[1]
+
+    def levels(self, room=12):
+        return [int(c["params"]["LEVEL"]) for c in self.d.calls("SendToDevice")
+                if c["id"] == room and c["cmd"] == "SET_VOLUME_LEVEL"]
+
+    def test_first_value_only_remembered(self):
+        self.assertEqual(self.sv(0.4)["result"], "recorded")
+        self.assertEqual(self.levels(), [])
+
+    def test_initial_flag_resets_baseline(self):
+        self.sv(0.4)
+        self.assertEqual(self.sv(0.9, initial=True)["result"], "recorded")
+        self.assertEqual(self.levels(), [])
+
+    def test_step_moves_from_current_room_level(self):
+        self.sv(0.4)
+        self.assertEqual(self.sv(0.5)["volume"], 45)        # room variable says 40, step 5
+        self.assertEqual(self.sv(0.4)["volume"], 40)
+        self.assertEqual(self.levels(), [45, 40])
+
+    def test_keypad_level_is_kept(self):
+        self.sv(0.4)
+        self.d.g.OnWatchedVariableChanged(12, 1011, "20")  # someone turned it down on a keypad
+        self.assertEqual(self.sv(0.5)["volume"], 25)
+
+    def test_absolute_for_bigger_jumps(self):
+        self.sv(0.1)
+        self.assertEqual(self.sv(0.8)["result"], "absolute")
+        self.assertEqual(self.levels(), [5 + round(0.8 * 65)])   # min + level * (max - min)
+
+    def test_cap_and_floor(self):
+        self.sv(0.4)
+        self.d.g.OnWatchedVariableChanged(12, 1011, "68")
+        self.assertEqual(self.sv(0.5)["volume"], 70)       # default max 70
+        self.d.g.OnWatchedVariableChanged(12, 1011, "7")
+        self.assertEqual(self.sv(0.4)["volume"], 5)        # default min 5
+
+    def test_no_volume_variable_falls_back_to_absolute(self):
+        self.d.g.ROOM_VARS[12] = self.d.lua.table_from({1000: self.d.lua.table_from({"name": "POWER_STATE", "value": "1"})})
+        self.sv(0.4)
+        self.assertEqual(self.sv(0.5)["result"], "absolute")
+
+    def test_duck_lowers_and_restores(self):
+        self.play()
+        self.sv(0.4)
+        r = self.d.http("POST", "/duck", {"room_id": 12, "active": True})[1]
+        self.assertEqual((r["result"], r["ducked"]), ("ducked", True))
+        self.assertEqual(self.levels(), [12])               # 30 % of 40
+        self.sv(0.5)                                        # "Алиса, громче" while ducked
+        self.assertEqual(self.levels(), [12])               # nothing yet
+        r = self.d.http("POST", "/duck", {"room_id": 12, "active": False})[1]
+        self.assertEqual(r["result"], "restored")
+        self.assertEqual(self.levels(), [12, 45])           # restored with the step applied
+
+    def test_duck_only_while_playing(self):
+        r = self.d.http("POST", "/duck", {"room_id": 12, "active": True})[1]
+        self.assertEqual(r["result"], "not playing")
+        self.assertEqual(self.d.calls("SendToDevice"), [])
+
+    def test_duck_released_by_timeout(self):
+        self.play()
+        self.d.http("POST", "/duck", {"room_id": 12, "active": True})
+        self.d.fire_timers()
+        self.assertEqual(self.levels(), [12, 40])
+        self.assertFalse(self.d.g.YANDEX_RELAY_TEST.vol[12]["ducked"])
+
+    def test_duck_mute_and_off_modes(self):
+        self.play()
+        self.select_room("Гостиная & кухня")
+        self.set_prop("Volume: Duck", "Mute")
+        self.d.clear()
+        self.d.http("POST", "/duck", {"room_id": 12, "active": True})
+        self.d.http("POST", "/duck", {"room_id": 12, "active": False})
+        self.assertEqual([c["cmd"] for c in self.d.calls("SendToDevice")], ["MUTE_ON", "MUTE_OFF"])
+        self.set_prop("Volume: Duck", "Off")
+        self.d.clear()
+        self.assertEqual(self.d.http("POST", "/duck", {"room_id": 12, "active": True})[1]["result"], "off")
+        self.assertEqual(self.d.calls("SendToDevice"), [])
+
+    # --- Composer properties -------------------------------------------------
+    def select_room(self, name):
+        self.d.g.PROPS["Volume: Room"] = name
+        self.d.g.OnPropertyChanged("Volume: Room")
+
+    def set_prop(self, name, value):
+        self.d.g.PROPS[name] = value
+        self.d.g.OnPropertyChanged(name)
+
+    def test_room_selector_lists_project_rooms(self):
+        lists = [c for c in self.d.calls("UpdatePropertyList") if c["name"] == "Volume: Room"]
+        self.assertEqual(lists[-1]["list"], "-,Гостиная & кухня,Спальня")
+
+    def test_settings_saved_per_room(self):
+        self.select_room("Спальня")
+        self.assertEqual(self.d.prop("Volume: Max %"), "70")        # defaults loaded
+        self.assertEqual(self.d.prop("Volume: Current"), "40 %")
+        self.set_prop("Volume: Max %", "50")
+        self.set_prop("Volume: Step %", "10")
+        self.assertEqual(self.d.g.PERSIST["volume_cfg"]["13"]["max"], 50)
+        self.sv(0.4, room=13)
+        self.assertEqual(self.sv(0.5, room=13)["volume"], 50)        # 40 + 10, capped 50
+        self.assertEqual(self.d.g.YANDEX_RELAY_TEST.vol_cfg(12)["max"], 70)   # other room untouched
+        self.select_room("Гостиная & кухня")
+        self.assertEqual(self.d.prop("Volume: Max %"), "70")
+        self.select_room("Спальня")
+        self.assertEqual(self.d.prop("Volume: Step %"), "10")
+
+    def test_min_kept_below_max(self):
+        self.select_room("Спальня")
+        self.set_prop("Volume: Min %", "80")
+        self.assertEqual(self.d.prop("Volume: Min %"), "69")
+
+    def test_field_without_room_not_saved(self):
+        self.set_prop("Volume: Max %", "10")
+        self.assertIsNone(self.d.g.PERSIST["volume_cfg"])
+
+    def test_calibration_actions(self):
+        self.select_room("Спальня")
+        self.d.g.OnWatchedVariableChanged(13, 1011, "55")
+        self.assertEqual(self.d.prop("Volume: Current"), "55 %")
+        self.d.g.ExecuteCommand("LUA_ACTION", self.d.lua.table_from({"ACTION": "VolMaxFromCurrent"}))
+        self.assertEqual(self.d.prop("Volume: Max %"), "55")
+        self.d.g.OnWatchedVariableChanged(13, 1011, "15")
+        self.d.g.ExecuteCommand("LUA_ACTION", self.d.lua.table_from({"ACTION": "VolMinFromCurrent"}))
+        self.assertEqual(self.d.prop("Volume: Min %"), "15")
+        self.assertEqual(dict(self.d.g.PERSIST["volume_cfg"]["13"].items())["max"], 55)
+
+    def test_settings_survive_restart(self):
+        self.select_room("Спальня")
+        self.set_prop("Volume: Max %", "40")
+        self.d.g.OnDriverLateInit()
+        self.assertEqual(self.d.g.YANDEX_RELAY_TEST.vol_cfg(13)["max"], 40)
+
+    # --- reporting --------------------------------------------------------
+    def test_room_volume_change_reported_to_ha(self):
+        self.play()
+        self.d.http("GET", "/state?room_id=12")                    # starts watching the variable
+        self.sv(0.4)
+        self.d.g.OnWatchedVariableChanged(12, 1011, "33")
+        ev = self.d.webhooks("volume")[-1]
+        self.assertEqual((ev["room_id"], ev["level"]), (12, 33))
+        self.assertEqual(self.d.http("GET", "/state?room_id=12")[1]["volume"], 33)
+
+    def test_direct_volume_capped(self):
+        self.assertEqual(self.d.http("POST", "/volume", {"room_id": 12, "level": 95})[1]["volume"], 70)
 
 
 class Actions(unittest.TestCase):

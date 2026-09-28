@@ -104,6 +104,17 @@ class RelayHub:
             for yentry in self.hass.config_entries.async_entries(YANDEX_DOMAIN):
                 await self.hass.config_entries.async_reload(yentry.entry_id)
 
+    async def alice_listening(self, station: str, active: bool) -> None:
+        """Duck the station's room while Alice listens/answers (driver decides how)."""
+        room = self.bindings.get(station)
+        if room is None or not self.enabled(station):
+            return
+        try:
+            resp = await self.client.duck(room, active)
+            _LOGGER.debug("duck room %s active=%s: %s", room, active, resp.get("result"))
+        except RelayError as err:
+            _LOGGER.warning("duck room %s failed: %s", room, err)
+
     # --- driver events -----------------------------------------------------
     async def handle_event(self, evt: dict[str, Any]) -> None:
         event = evt.get("event")
@@ -113,6 +124,9 @@ class RelayHub:
 
         if event == "state" and room in self.players:
             self.players[room].set_relay_state(evt.get("state"))
+        elif event == "volume" and room in self.players:
+            self.players[room].set_room_volume(evt.get("level"))
+            return
 
         station = self.station_for_room(room)
         if station is None or not self.enabled(station):
@@ -169,6 +183,12 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         old, new = event.data.get("old_state"), event.data.get("new_state")
         if new is None:
             return
+        # Alice listening/answering: AlexxIT unmutes the station for that
+        # time on the same attribute, so the room ducks at the same moment.
+        was = old.attributes.get("alice_state") if old else None
+        now = new.attributes.get("alice_state")
+        if now != was and now is not None:
+            hass.async_create_task(hub.alice_listening(new.entity_id, now != "IDLE"))
         keys = ("source", "source_list")
         if old is None or old.state != new.state or any(
             old.attributes.get(k) != new.attributes.get(k) for k in keys

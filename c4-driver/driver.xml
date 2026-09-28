@@ -6,8 +6,8 @@
   <name>Yandex Relay</name>
   <model>Yandex Relay</model>
   <created>09/28/2026 00:00</created>
-  <modified>09/28/2026 21:16</modified>
-  <version>9</version>
+  <modified>09/28/2026 21:26</modified>
+  <version>10</version>
   <control>lua_gen</control>
   <controlmethod>IP</controlmethod>
   <driver>DriverWorks</driver>
@@ -51,6 +51,64 @@
         <readonly>true</readonly>
       </property>
       <property>
+        <name>Volume: Room</name>
+        <type>LIST</type>
+        <items>
+          <item>-</item>
+        </items>
+        <default>-</default>
+        <readonly>false</readonly>
+      </property>
+      <property>
+        <name>Volume: Current</name>
+        <type>STRING</type>
+        <default></default>
+        <readonly>true</readonly>
+      </property>
+      <property>
+        <name>Volume: Step %</name>
+        <type>RANGED_INTEGER</type>
+        <minimum>1</minimum>
+        <maximum>20</maximum>
+        <default>5</default>
+        <readonly>false</readonly>
+      </property>
+      <property>
+        <name>Volume: Max %</name>
+        <type>RANGED_INTEGER</type>
+        <minimum>5</minimum>
+        <maximum>100</maximum>
+        <default>70</default>
+        <readonly>false</readonly>
+      </property>
+      <property>
+        <name>Volume: Min %</name>
+        <type>RANGED_INTEGER</type>
+        <minimum>0</minimum>
+        <maximum>95</maximum>
+        <default>5</default>
+        <readonly>false</readonly>
+      </property>
+      <property>
+        <name>Volume: Duck</name>
+        <type>LIST</type>
+        <items>
+          <item>Lower</item>
+          <item>Mute</item>
+          <item>Off</item>
+        </items>
+        <default>Lower</default>
+        <readonly>false</readonly>
+      </property>
+      <property>
+        <name>Volume: Duck Level %</name>
+        <type>RANGED_INTEGER</type>
+        <minimum>0</minimum>
+        <maximum>100</maximum>
+        <default>30</default>
+        <readonly>false</readonly>
+      </property>
+      <property>
         <name>Debug Mode</name>
         <type>LIST</type>
         <items>
@@ -63,7 +121,7 @@
       <property>
         <name>Driver Version</name>
         <type>STRING</type>
-        <default>0.1.7</default>
+        <default>0.2.0</default>
         <readonly>true</readonly>
       </property>
     </properties>
@@ -80,6 +138,14 @@
       <action>
         <name>Refresh Rooms</name>
         <command>RefreshRooms</command>
+      </action>
+      <action>
+        <name>Volume: Set Max from Current</name>
+        <command>VolMaxFromCurrent</command>
+      </action>
+      <action>
+        <name>Volume: Set Min from Current</name>
+        <command>VolMinFromCurrent</command>
       </action>
     </actions>
     <commands/>

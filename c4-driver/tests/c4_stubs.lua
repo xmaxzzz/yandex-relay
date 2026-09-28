@@ -62,6 +62,20 @@ function C4:RoomGetId() return 77 end
 function C4:GetDeviceDisplayName(id) return "Room " .. tostring(id) end
 function C4:GetDeviceID() return 555 end
 function C4:GetVariable(dev, var) return "" end
+function C4:UpdatePropertyList(name, list, default)
+    rec("UpdatePropertyList", { name = name, list = list, default = default })
+    PROPS[name] = default
+end
+-- Room variables: every room has a CURRENT_VOLUME of 40 unless a test sets ROOM_VARS[id].
+ROOM_VARS = {}
+function C4:GetDeviceVariables(id)
+    rec("GetDeviceVariables", { id = id })
+    return ROOM_VARS[id] or {
+        [1000] = { name = "POWER_STATE", value = "1" },
+        [1011] = { name = "CURRENT_VOLUME", value = "40" },
+        [1012] = { name = "IS_MUTED", value = "0" },
+    }
+end
 function C4:RegisterVariableListener(dev, var) rec("RegisterVariableListener", { dev = dev, var = var }) end
 function C4:url()
     local o = {}

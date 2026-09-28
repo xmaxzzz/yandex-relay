@@ -50,6 +50,8 @@ def mock_driver(aioclient_mock, info_status: int = 200) -> None:
     aioclient_mock.post(f"{BASE}/pause", json={"room_id": 21, "state": "paused"})
     aioclient_mock.post(f"{BASE}/resume", json={"room_id": 21, "state": "playing", "resume": "in_place"})
     aioclient_mock.post(f"{BASE}/stop", json={"room_id": 21, "state": "stopped"})
+    aioclient_mock.post(f"{BASE}/station_volume", json={"room_id": 21, "result": "step", "volume": 45})
+    aioclient_mock.post(f"{BASE}/duck", json={"room_id": 21, "result": "ducked", "ducked": True})
 
 
 def add_station(hass: HomeAssistant, *, area: str | None = "Офис", state: str = "playing",
@@ -272,3 +274,46 @@ async def test_bad_code_at_setup_starts_reauth(hass, aioclient_mock) -> None:
     assert entry.state is ConfigEntryState.SETUP_ERROR
     flows = hass.config_entries.flow.async_progress()
     assert any(f["context"]["source"] == config_entries.SOURCE_REAUTH for f in flows)
+
+
+# --- volume (0.2.0) ----------------------------------------------------------
+
+async def test_station_volume_goes_to_driver_first_as_baseline(hass, aioclient_mock, relay) -> None:
+    entry, _, _ = relay
+    pid = player_id(hass, entry)
+    for level in (0.4, 0.5):
+        await hass.services.async_call("media_player", "volume_set",
+                                       {"entity_id": pid, "volume_level": level}, blocking=True)
+    bodies = [c[2] for c in calls_to(aioclient_mock, "/station_volume")]
+    assert bodies == [{"room_id": 21, "level": 0.4, "initial": True},
+                      {"room_id": 21, "level": 0.5, "initial": False}]
+    assert hass.states.get(pid).attributes["volume_level"] == 0.45   # room level from the driver
+
+
+async def test_alice_state_ducks_room(hass, aioclient_mock, relay) -> None:
+    _, station, _ = relay
+    for state in ("LISTENING", "SPEAKING", "IDLE"):
+        set_station(hass, station, alice_state=state)
+        await hass.async_block_till_done()
+    bodies = [c[2] for c in calls_to(aioclient_mock, "/duck")]
+    assert bodies[-3:] == [{"room_id": 21, "active": True}, {"room_id": 21, "active": True},
+                           {"room_id": 21, "active": False}]
+
+
+async def test_alice_state_ignored_when_streaming_disabled(hass, aioclient_mock, relay) -> None:
+    entry, station, _ = relay
+    sw = er.async_get(hass).async_get_entity_id("switch", DOMAIN, f"{entry.entry_id}_{station}_enabled")
+    await hass.services.async_call("switch", "turn_off", {"entity_id": sw}, blocking=True)
+    n = len(calls_to(aioclient_mock, "/duck"))
+    set_station(hass, station, alice_state="LISTENING")
+    await hass.async_block_till_done()
+    assert len(calls_to(aioclient_mock, "/duck")) == n
+
+
+async def test_webhook_room_volume_shown_on_player(hass, relay, hass_client_no_auth) -> None:
+    entry, _, calls = relay
+    client = await hass_client_no_auth()
+    await client.post(f"/api/webhook/{HOOK}", json={"event": "volume", "room_id": 21, "level": 33})
+    await hass.async_block_till_done()
+    assert hass.states.get(player_id(hass, entry)).attributes["volume_level"] == 0.33
+    assert calls == []                  # volume changes on the C4 side never touch the station

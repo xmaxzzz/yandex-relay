@@ -1,5 +1,5 @@
 -- ============================================================
--- Yandex Relay  Control4 Driver  v0.1.7
+-- Yandex Relay  Control4 Driver  v0.2.0
 --
 -- Plays the music a Yandex Station has started into the Control4 room the
 -- station is bound to. The station stays the queue master (via AlexxIT
@@ -9,6 +9,15 @@
 -- Design, protocol and stages: docs/DESIGN.md in the yandex-relay repo.
 --
 -- Changelog:
+--   v0.2.0 - Volume. HA reports the station volume (/station_volume) and
+--            Alice's listening state (/duck); the driver maps them onto the
+--            room: one Alice step moves the room by a per-room step from its
+--            current level (read from the room's volume variable), bigger
+--            changes map onto min..max, first value only remembered; ducking
+--            lowers (or mutes) the room while Alice talks and restores it.
+--            Per-room calibration in Composer: "Volume: Room" selector plus
+--            Step/Max/Min/Duck/Duck Level, "Volume: Current", actions
+--            "Set Max/Min from Current". /volume for direct level.
 --   v0.1.7 - Pause/stop (from HA and from the panel) switch the room off:
 --            digital audio's PAUSE on an internet radio queue left the room
 --            sounding (site test with the station, 2026-09-28). The OFF that
@@ -42,7 +51,7 @@
 --            selection events pushed to the Home Assistant webhook.
 -- ============================================================
 
-local DRIVER_VERSION  = "0.1.7"
+local DRIVER_VERSION  = "0.2.0"
 local PROXY           = 5001
 local DIGITAL_AUDIO   = 100002   -- Digital Audio device (same id TuneIn watches)
 local DA_ROOM_MAP_VAR = 1009     -- its room<->queue map variable (XML)
@@ -54,6 +63,10 @@ local MAX_REQUEST     = 65536    -- bytes: max HTTP request we accept
 local CLOSE_DELAY_MS  = 1500     -- give the client time to read before we close
 local SERVER_CHECK_MS = 10000    -- bridge must report ONLINE this soon after start
 local SERVER_RETRY_MS = 30000    -- then retry this often until it does
+local DUCK_MAX_MS     = 30000    -- a duck HA never releases is lifted after this
+-- Per-room volume defaults (Composer "Volume:" properties override them per room).
+local VOL_DEFAULTS    = { step = 5, max = 70, min = 5, duck = "Lower", duck_level = 30 }
+local VOL_NO_ROOM     = "-"
 
 -- ============================================================
 -- BUNDLED JSON LIBRARY (Jeffrey Friedl, public domain)
@@ -605,6 +618,8 @@ end
 -- ============================================================
 -- ROOMS DISCOVERY
 -- ============================================================
+local UpdateVolumeRoomList   -- volume section, below
+
 local function DiscoverRooms()
     local rooms, types = {}, {}
     local ok, xml = pcall(function()
@@ -636,6 +651,7 @@ local function DiscoverRooms()
     local names = {}
     for i, r in ipairs(rooms) do names[i] = r.name end
     C4:UpdateProperty("Rooms Found", (#rooms .. ": " .. table.concat(names, ", ")):sub(1, 250))
+    if UpdateVolumeRoomList then UpdateVolumeRoomList(rooms) end
     return rooms
 end
 
@@ -672,10 +688,260 @@ local function OnRoomMap(xml)
     end
 end
 
+local OnRoomVolumeVariableRef   -- volume section, below
+
 function OnWatchedVariableChanged(idDevice, idVariable, strValue)
-    if tonumber(idDevice) == DIGITAL_AUDIO and tonumber(idVariable) == DA_ROOM_MAP_VAR then
+    idDevice, idVariable = tonumber(idDevice), tonumber(idVariable)
+    if idDevice == DIGITAL_AUDIO and idVariable == DA_ROOM_MAP_VAR then
         OnRoomMap(strValue)
+    elseif OnRoomVolumeVariableRef then
+        OnRoomVolumeVariableRef(idDevice, idVariable, strValue)
     end
+end
+
+
+-- ============================================================
+-- VOLUME (per room: station volume -> C4 room volume, ducking)
+-- ============================================================
+-- HA reports the station volume (0..1) and whether Alice is listening; the
+-- driver owns the per-room calibration and the room's real volume:
+--   * one Alice step (+-0.1) moves the room by "step" from its CURRENT level,
+--     so a level set on a keypad is kept ("louder" adds to it);
+--   * a bigger change ("volume 5") maps absolutely onto min..max;
+--   * the first value after a (re)start is only remembered (AlexxIT sends the
+--     station's level as soon as streaming starts: no jump in the room);
+--   * while Alice listens/answers the room is lowered to duck_level % of its
+--     level (or muted) and restored exactly afterwards; volume changes made by
+--     voice during that time land in the level that is restored.
+-- The room's level comes from its CURRENT_VOLUME-like variable (listener).
+local gVolCfg   = {}   -- ["<roomId>"] = {step,max,min,duck,duck_level}  (persisted)
+local gVol      = {}   -- [roomId] = {cur, var, prev_station, ducked, saved, mode, timer}
+local gVolRoomByName = {}
+local gVolSelected   = nil   -- room id shown in the "Volume:" properties
+local gLoadingProps  = false
+
+local function Clamp(x, lo, hi) if x < lo then return lo elseif x > hi then return hi end return x end
+local function Round(x) return math.floor(x + 0.5) end
+
+local function VolCfg(roomId)
+    local c = gVolCfg[tostring(roomId)] or {}
+    return {
+        step = tonumber(c.step) or VOL_DEFAULTS.step,
+        max = tonumber(c.max) or VOL_DEFAULTS.max,
+        min = tonumber(c.min) or VOL_DEFAULTS.min,
+        duck = c.duck or VOL_DEFAULTS.duck,
+        duck_level = tonumber(c.duck_level) or VOL_DEFAULTS.duck_level,
+    }
+end
+
+local function SaveVolCfg(roomId, cfg)
+    gVolCfg[tostring(roomId)] = cfg
+    C4:PersistSetValue("volume_cfg", gVolCfg)
+end
+
+local function VolState(roomId)
+    roomId = tonumber(roomId)
+    local v = gVol[roomId]
+    if not v then v = {}; gVol[roomId] = v end
+    return v
+end
+
+-- Find the room's current-volume variable once and listen to it.
+local function WatchRoomVolume(roomId)
+    local v = VolState(roomId)
+    if v.var ~= nil then return v end
+    v.var = false
+    local ok, vars = pcall(function() return C4:GetDeviceVariables(roomId) end)
+    if not ok or type(vars) ~= "table" then
+        LogE("room " .. roomId .. ": no variables (" .. tostring(vars) .. ")")
+        return v
+    end
+    local names, pick, fallback = {}, nil, nil
+    for id, var in pairs(vars) do
+        local name = type(var) == "table" and tostring(var.name or var.NAME or "") or ""
+        names[#names + 1] = tostring(id) .. "=" .. name
+        if name == "CURRENT_VOLUME" then pick = { id = id, var = var }
+        elseif not fallback and name:find("VOLUME") and not name:find("MUTE") then
+            fallback = { id = id, var = var }
+        end
+    end
+    table.sort(names)
+    Log("room " .. roomId .. " variables: " .. table.concat(names, ", "):sub(1, 600))
+    pick = pick or fallback
+    if not pick then
+        LogE("room " .. roomId .. ": no volume variable, relative steps fall back to absolute")
+        return v
+    end
+    v.var = tonumber(pick.id)
+    v.cur = tonumber(type(pick.var) == "table" and (pick.var.value or pick.var.VALUE) or nil)
+    C4:RegisterVariableListener(roomId, v.var)
+    Log("room " .. roomId .. ": volume variable " .. v.var .. " = " .. tostring(v.cur))
+    return v
+end
+
+local function ShowCurrentVolume(roomId)
+    if gVolSelected == roomId then
+        local cur = VolState(roomId).cur
+        C4:UpdateProperty("Volume: Current", cur and (tostring(cur) .. " %") or "unknown")
+    end
+end
+
+local function SetRoomVolume(roomId, level)
+    level = Clamp(Round(level), 0, 100)
+    Log("room " .. roomId .. " volume -> " .. level)
+    C4:SendToDevice(roomId, "SET_VOLUME_LEVEL", { LEVEL = tostring(level) })
+    VolState(roomId).cur = level
+    ShowCurrentVolume(roomId)
+    return level
+end
+
+local function OnRoomVolumeVariable(roomId, value)
+    local v = VolState(roomId)
+    v.cur = tonumber(value) or v.cur
+    ShowCurrentVolume(roomId)
+    Webhook({ event = "volume", room_id = roomId, level = v.cur, ducked = v.ducked or false })
+end
+
+OnRoomVolumeVariableRef = function(idDevice, idVariable, value)
+    local v = gVol[idDevice]
+    if v and v.var and v.var == idVariable then OnRoomVolumeVariable(idDevice, value) end
+end
+
+local function StationVolume(roomId, level, initial)
+    local v, cfg = WatchRoomVolume(roomId), VolCfg(roomId)
+    level = Clamp(tonumber(level) or 0, 0, 1)
+    local prev = v.prev_station
+    v.prev_station = level
+    if initial or prev == nil then return "recorded", nil end
+    local d = level - prev
+    if math.abs(d) < 0.005 then return "unchanged", nil end
+    local base = v.ducked and v.saved or v.cur
+    local target, how
+    if math.abs(d) <= 0.15 and base then
+        target, how = base + (d > 0 and cfg.step or -cfg.step), "step"
+    else
+        target, how = cfg.min + level * (cfg.max - cfg.min), "absolute"
+    end
+    target = Clamp(Round(target), cfg.min, cfg.max)
+    if v.ducked then
+        v.saved = target        -- applied when the duck is lifted
+    else
+        SetRoomVolume(roomId, target)
+    end
+    return how, target
+end
+
+local function Unduck(roomId)
+    local v = VolState(roomId)
+    if not v.ducked then return false end
+    v.ducked = false
+    if v.timer then v.timer:Cancel(); v.timer = nil end
+    if v.mode == "Mute" then
+        C4:SendToDevice(roomId, "MUTE_OFF", {})
+    elseif v.saved then
+        SetRoomVolume(roomId, v.saved)
+    end
+    return true
+end
+
+local function Duck(roomId, active)
+    local v, cfg = WatchRoomVolume(roomId), VolCfg(roomId)
+    if not active then return Unduck(roomId) and "restored" or "not ducked" end
+    if cfg.duck == "Off" then return "off" end
+    if v.ducked then return "already" end
+    local r = gRooms[tonumber(roomId)]
+    if not r or r.state ~= "playing" then return "not playing" end
+    if cfg.duck == "Mute" then
+        C4:SendToDevice(roomId, "MUTE_ON", {})
+    else
+        if not v.cur then return "volume unknown" end
+        v.saved = v.cur
+        SetRoomVolume(roomId, v.cur * cfg.duck_level / 100)
+    end
+    v.ducked, v.mode = true, cfg.duck
+    v.timer = C4:SetTimer(DUCK_MAX_MS, function()
+        v.timer = nil
+        if v.ducked then LogI("room " .. roomId .. ": duck not released, restoring"); Unduck(roomId) end
+    end)
+    return "ducked"
+end
+
+-- Composer: "Volume: Room" picks the room, the fields below edit its settings.
+local function LoadVolumeProps(roomId)
+    local cfg = VolCfg(roomId)
+    gLoadingProps = true
+    C4:UpdateProperty("Volume: Step %", tostring(cfg.step))
+    C4:UpdateProperty("Volume: Max %", tostring(cfg.max))
+    C4:UpdateProperty("Volume: Min %", tostring(cfg.min))
+    C4:UpdateProperty("Volume: Duck", cfg.duck)
+    C4:UpdateProperty("Volume: Duck Level %", tostring(cfg.duck_level))
+    gLoadingProps = false
+    WatchRoomVolume(roomId)
+    ShowCurrentVolume(roomId)
+end
+
+UpdateVolumeRoomList = function(rooms)
+    gVolRoomByName = {}
+    local names, selectedName = {}, nil
+    for _, r in ipairs(rooms) do
+        local name = tostring(r.name):gsub(",", " ")
+        if gVolRoomByName[name] then name = name .. " (" .. r.id .. ")" end
+        gVolRoomByName[name] = r.id
+        names[#names + 1] = name
+        if r.id == gVolSelected then selectedName = name end
+    end
+    if not selectedName then gVolSelected = nil end
+    C4:UpdatePropertyList("Volume: Room",
+        VOL_NO_ROOM .. (#names > 0 and ("," .. table.concat(names, ",")) or ""),
+        selectedName or VOL_NO_ROOM)
+end
+
+local VOL_FIELDS = {
+    ["Volume: Step %"] = "step", ["Volume: Max %"] = "max", ["Volume: Min %"] = "min",
+    ["Volume: Duck"] = "duck", ["Volume: Duck Level %"] = "duck_level",
+}
+
+-- Returns true when the property was a volume one.
+local function OnVolumeProperty(name)
+    if name == "Volume: Room" then
+        gVolSelected = gVolRoomByName[Properties["Volume: Room"]]
+        if gVolSelected then LoadVolumeProps(gVolSelected)
+        else C4:UpdateProperty("Volume: Current", "") end
+        return true
+    end
+    local key = VOL_FIELDS[name]
+    if not key then return false end
+    if gLoadingProps then return true end
+    if not gVolSelected then
+        LogE("pick a room in \"Volume: Room\" first; " .. name .. " not saved")
+        return true
+    end
+    local cfg = VolCfg(gVolSelected)
+    cfg[key] = (key == "duck") and Properties[name] or tonumber(Properties[name])
+    if cfg.min >= cfg.max then
+        cfg.min = math.max(0, cfg.max - 1)
+        gLoadingProps = true
+        C4:UpdateProperty("Volume: Min %", tostring(cfg.min))
+        gLoadingProps = false
+    end
+    SaveVolCfg(gVolSelected, cfg)
+    Log("room " .. gVolSelected .. " volume settings " .. JSON:encode(cfg))
+    return true
+end
+
+-- Calibration: set the level you like on a keypad, then take it as max/min.
+local function TakeCurrentAs(key)
+    if not gVolSelected then LogE("pick a room in \"Volume: Room\" first"); return end
+    local cur = WatchRoomVolume(gVolSelected).cur
+    if not cur then LogE("room " .. gVolSelected .. ": current volume unknown"); return end
+    local cfg = VolCfg(gVolSelected)
+    cfg[key] = cur
+    if cfg.min >= cfg.max then
+        if key == "max" then cfg.min = math.max(0, cur - 1) else cfg.max = math.min(100, cur + 1) end
+    end
+    SaveVolCfg(gVolSelected, cfg)
+    LoadVolumeProps(gVolSelected)
+    LogI("room " .. gVolSelected .. ": " .. key .. " = " .. cur .. " %")
 end
 
 -- ============================================================
@@ -687,10 +953,12 @@ local REASONS = { [200] = "OK", [400] = "Bad Request", [401] = "Unauthorized",
 
 local function RoomState(r)
     local t = r.track or {}
+    local v = gVol[r.id] or {}
     return {
         room_id = r.id, state = r.state, queue_id = r.queueId,
         title = t.title, artist = t.artist,
         source = r.track and (r.fallback_used and "fallback" or "direct") or nil,
+        volume = v.cur, ducked = v.ducked or false,
     }
 end
 
@@ -753,6 +1021,29 @@ API["POST /resume"] = function(req, b)
     st.resume = Resume(r)
     st.state = r.state
     return 200, st
+end
+
+API["POST /station_volume"] = function(req, b)
+    local r = GetRoom(b.room_id)
+    if not r or b.level == nil then return 400, { error = "room_id and level required" } end
+    local how, target = StationVolume(r.id, b.level, b.initial == true)
+    return 200, { room_id = r.id, result = how, volume = target or VolState(r.id).cur }
+end
+
+API["POST /duck"] = function(req, b)
+    local r = GetRoom(b.room_id)
+    if not r then return 400, { error = "room_id required" } end
+    local result = Duck(r.id, b.active == true)
+    return 200, { room_id = r.id, result = result, ducked = VolState(r.id).ducked or false }
+end
+
+-- Direct room level (tests, relayctl); still capped by the room's max.
+API["POST /volume"] = function(req, b)
+    local r = GetRoom(b.room_id)
+    if not r or b.level == nil then return 400, { error = "room_id and level required" } end
+    WatchRoomVolume(r.id)
+    local cfg = VolCfg(r.id)
+    return 200, { room_id = r.id, volume = SetRoomVolume(r.id, Clamp(tonumber(b.level) or 0, 0, cfg.max)) }
 end
 
 API["GET /state"] = function(req)
@@ -1133,11 +1424,16 @@ function ExecuteCommand(sCommand, tParams)
         Unpair(); LogI("unpaired")
     elseif action == "RefreshRooms" then
         DiscoverRooms()
+    elseif action == "VolMaxFromCurrent" then
+        TakeCurrentAs("max")
+    elseif action == "VolMinFromCurrent" then
+        TakeCurrentAs("min")
     end
 end
 
 function OnPropertyChanged(name)
-    if name == "Bridge Port" then StartServer() end
+    if name == "Bridge Port" then StartServer(); return end
+    OnVolumeProperty(name)
 end
 
 function OnDriverInit()
@@ -1154,6 +1450,9 @@ function OnDriverLateInit()
     local wh = C4:PersistGetValue("webhook", true)
     gPairing.webhook = (type(wh) == "string" and wh ~= "") and wh or nil
     C4:UpdateProperty("Paired With", HostOf(gPairing.webhook))
+
+    local vc = C4:PersistGetValue("volume_cfg")
+    gVolCfg = type(vc) == "table" and vc or {}
 
     C4:SendToProxy(PROXY, "ENABLE_DRIVER", {}, "COMMAND")
     OnRoomMap(C4:GetVariable(DIGITAL_AUDIO, DA_ROOM_MAP_VAR))
@@ -1175,4 +1474,6 @@ if YANDEX_RELAY_TEST then
     YANDEX_RELAY_TEST.parse_room_map = ParseRoomMap
     YANDEX_RELAY_TEST.parse_request = ParseRequest
     YANDEX_RELAY_TEST.project_rooms = function() return gProjectRooms end
+    YANDEX_RELAY_TEST.vol = gVol
+    YANDEX_RELAY_TEST.vol_cfg = function(id) return VolCfg(id) end
 end

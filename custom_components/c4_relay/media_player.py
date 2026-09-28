@@ -78,6 +78,7 @@ class RelayRoomPlayer(MediaPlayerEntity):
         self._attr_device_info = hub_device(hub)
         self._attr_state = MediaPlayerState.IDLE
         self._attr_volume_level = None
+        self._station_volume_seen = False
 
     async def async_added_to_hass(self) -> None:
         try:
@@ -91,7 +92,16 @@ class RelayRoomPlayer(MediaPlayerEntity):
         if self.hass is not None:
             self.async_write_ha_state()
 
+    def set_room_volume(self, level: Any) -> None:
+        """The room's real Control4 volume (0..100) reported by the driver."""
+        if isinstance(level, (int, float)):
+            self._attr_volume_level = max(0.0, min(1.0, level / 100))
+            if self.hass is not None:
+                self.async_write_ha_state()
+
     def _apply(self, resp: dict[str, Any]) -> None:
+        if isinstance(resp.get("volume"), (int, float)):
+            self._attr_volume_level = max(0.0, min(1.0, resp["volume"] / 100))
         if resp.get("title") is not None:
             self._attr_media_title = resp.get("title")
             self._attr_media_artist = resp.get("artist")
@@ -166,7 +176,18 @@ class RelayRoomPlayer(MediaPlayerEntity):
             await self._hub.station_call(station, "media_previous_track")
 
     async def async_set_volume_level(self, volume: float) -> None:
-        # Stage 1: AlexxIT syncs the station volume here; mapping it to the
-        # room's Control4 volume (with a per-room cap) is stage 2.
-        self._attr_volume_level = volume
-        self.async_write_ha_state()
+        """AlexxIT syncs the station volume here ("Алиса, громче" etc.).
+
+        The driver turns it into a room level with the room's calibration
+        (step, min, max from Composer). The first value after start-up is only a
+        baseline: AlexxIT sends the station's level as soon as it starts
+        streaming, which must not change the room.
+        """
+        initial = not self._station_volume_seen
+        self._station_volume_seen = True
+        try:
+            resp = await self._hub.client.station_volume(self.room_id, volume, initial)
+        except RelayError as err:
+            raise HomeAssistantError(f"Control4 Yandex Relay: {err}") from err
+        if isinstance(resp.get("volume"), (int, float)):
+            self.set_room_volume(resp["volume"])
