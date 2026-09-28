@@ -1,0 +1,51 @@
+{
+  "config": {
+    "step": {
+      "user": {
+        "title": "Control4 Yandex Relay",
+        "description": "Connect to the Yandex Relay driver on the Control4 controller. The pairing code is in the driver's properties in Composer. The Home Assistant URL must be reachable from the controller (use the IP address, not a .local name).",
+        "data": {
+          "host": "Controller IP",
+          "port": "Bridge port",
+          "pairing_code": "Pairing code",
+          "ha_url": "Home Assistant URL for the controller"
+        }
+      },
+      "bind": {
+        "title": "Stations and rooms",
+        "description": "Pick the Control4 room each Yandex Station streams its music to."
+      },
+      "reauth_confirm": {
+        "title": "New pairing code",
+        "description": "The driver on {host} rejected the pairing code (it was probably re-added). Enter the new code from its properties in Composer.",
+        "data": {
+          "pairing_code": "Pairing code",
+          "port": "Bridge port"
+        }
+      }
+    },
+    "error": {
+      "cannot_connect": "Cannot reach the driver. Check the IP, the port and that Bridge Status is ONLINE.",
+      "invalid_auth": "Wrong pairing code.",
+      "bad_url": "The URL must start with http:// or https://."
+    },
+    "abort": {
+      "already_configured": "This driver is already set up.",
+      "reauth_successful": "Pairing updated.",
+      "no_stations": "No Yandex Stations found. Set up AlexxIT YandexStation first."
+    }
+  },
+  "options": {
+    "step": {
+      "init": {
+        "title": "Stations and rooms",
+        "description": "Pick the Control4 room each Yandex Station streams its music to."
+      }
+    },
+    "abort": {
+      "cannot_connect": "Cannot reach the driver.",
+      "invalid_auth": "Wrong pairing code: reconfigure the integration.",
+      "no_stations": "No Yandex Stations found."
+    }
+  }
+}

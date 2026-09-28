@@ -1,0 +1,6 @@
+# build output: only the current .c4z is kept in git
+c4-driver/*_v*.c4z
+__pycache__/
+*.pyc
+.claude/settings.local.json
+.pytest_cache/

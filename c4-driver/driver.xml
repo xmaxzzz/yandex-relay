@@ -1,0 +1,210 @@
+<?xml version="1.0" encoding="utf-8"?>
+<devicedata>
+  <copyright>2026</copyright>
+  <creator>Community</creator>
+  <manufacturer>Yandex</manufacturer>
+  <name>Yandex Relay</name>
+  <model>Yandex Relay</model>
+  <created>09/28/2026 00:00</created>
+  <modified>09/28/2026 15:31</modified>
+  <version>8</version>
+  <control>lua_gen</control>
+  <controlmethod>IP</controlmethod>
+  <driver>DriverWorks</driver>
+  <small>www/icons/device_sm.png</small>
+  <large>www/icons/device_lg.png</large>
+
+  <config>
+    <script jit="1" file="driver.lua"/>
+
+    <properties>
+      <property>
+        <name>Bridge Port</name>
+        <type>RANGED_INTEGER</type>
+        <minimum>1024</minimum>
+        <maximum>65535</maximum>
+        <default>18765</default>
+        <readonly>false</readonly>
+      </property>
+      <property>
+        <name>Pairing Code</name>
+        <type>STRING</type>
+        <default></default>
+        <readonly>true</readonly>
+      </property>
+      <property>
+        <name>Paired With</name>
+        <type>STRING</type>
+        <default></default>
+        <readonly>true</readonly>
+      </property>
+      <property>
+        <name>Bridge Status</name>
+        <type>STRING</type>
+        <default></default>
+        <readonly>true</readonly>
+      </property>
+      <property>
+        <name>Rooms Found</name>
+        <type>STRING</type>
+        <default></default>
+        <readonly>true</readonly>
+      </property>
+      <property>
+        <name>Debug Mode</name>
+        <type>LIST</type>
+        <items>
+          <item>Off</item>
+          <item>On</item>
+        </items>
+        <default>Off</default>
+        <readonly>false</readonly>
+      </property>
+      <property>
+        <name>Driver Version</name>
+        <type>STRING</type>
+        <default>0.1.6</default>
+        <readonly>true</readonly>
+      </property>
+    </properties>
+
+    <actions>
+      <action>
+        <name>Regenerate Pairing Code</name>
+        <command>RegeneratePairingCode</command>
+      </action>
+      <action>
+        <name>Unpair Home Assistant</name>
+        <command>Unpair</command>
+      </action>
+      <action>
+        <name>Refresh Rooms</name>
+        <command>RefreshRooms</command>
+      </action>
+    </actions>
+    <commands/>
+  </config>
+
+  <proxies>
+    <proxy proxybindingid="5001" primary="True" name="Yandex Relay" image_source="c4z" small_image="www/icons/device_sm.png" large_image="www/icons/device_lg.png">media_service</proxy>
+  </proxies>
+
+  <capabilities>
+    <hide_in_list_nav>False</hide_in_list_nav>
+    <hide_in_media>True</hide_in_media>
+    <digital_audio_support>True</digital_audio_support>
+    <can_scan_media>False</can_scan_media>
+    <ui_selects_device>True</ui_selects_device>
+    <list_nowplaying_non_c4>True</list_nowplaying_non_c4>
+
+    <UI xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" proxybindingid="5001">
+      <DeviceIcon>device</DeviceIcon>
+
+      <NowPlaying>
+        <ActionIds></ActionIds>
+        <Image/>
+        <List>
+          <TitleProperty>title</TitleProperty>
+          <SubTitleProperty>subtitle</SubTitleProperty>
+          <ImageProperty>image_list</ImageProperty>
+          <LengthProperty>duration</LengthProperty>
+          <IsHeader>
+            <Property>isHeader</Property>
+            <ValidValues>
+              <Value>true</Value>
+            </ValidValues>
+          </IsHeader>
+        </List>
+      </NowPlaying>
+
+      <Dashboard>
+        <Transport>
+          <Id>SkipRev</Id>
+          <ButtonType>SKIP_REV</ButtonType>
+          <ReleaseCommand>
+            <Name>SKIP_REV</Name>
+            <Type>PROTOCOL</Type>
+          </ReleaseCommand>
+        </Transport>
+        <Transport>
+          <Id>Play</Id>
+          <ButtonType>PLAY</ButtonType>
+          <ReleaseCommand>
+            <Name>PLAY</Name>
+            <Type>PROTOCOL</Type>
+          </ReleaseCommand>
+        </Transport>
+        <Transport>
+          <Id>Pause</Id>
+          <ButtonType>PAUSE</ButtonType>
+          <ReleaseCommand>
+            <Name>PAUSE</Name>
+            <Type>ROOM</Type>
+          </ReleaseCommand>
+        </Transport>
+        <Transport>
+          <Id>Stop</Id>
+          <ButtonType>STOP</ButtonType>
+          <ReleaseCommand>
+            <Name>STOP</Name>
+            <Type>ROOM</Type>
+          </ReleaseCommand>
+        </Transport>
+        <Transport>
+          <Id>SkipFwd</Id>
+          <ButtonType>SKIP_FWD</ButtonType>
+          <ReleaseCommand>
+            <Name>SKIP_FWD</Name>
+            <Type>PROTOCOL</Type>
+          </ReleaseCommand>
+        </Transport>
+      </Dashboard>
+    </UI>
+  </capabilities>
+
+  <events/>
+
+  <connections>
+    <connection>
+      <id>5001</id>
+      <type>2</type>
+      <connectionname>Media Service</connectionname>
+      <consumer>False</consumer>
+      <linelevel>False</linelevel>
+      <classes>
+        <class><classname>MediaService</classname></class>
+      </classes>
+    </connection>
+    <connection proxybindingid="5001">
+      <id>4001</id>
+      <type>6</type>
+      <connectionname>Digital Audio</connectionname>
+      <consumer>False</consumer>
+      <audiosource>True</audiosource>
+      <videosource>False</videosource>
+      <linelevel>True</linelevel>
+      <classes>
+        <class>
+          <autobind>True</autobind>
+          <classname>DIGITAL_AUDIO_SERVER</classname>
+        </class>
+      </classes>
+    </connection>
+    <connection proxybindingid="5001">
+      <id>4002</id>
+      <type>6</type>
+      <connectionname>Digital Audio Client</connectionname>
+      <consumer>True</consumer>
+      <audiosource>False</audiosource>
+      <videosource>False</videosource>
+      <linelevel>True</linelevel>
+      <classes>
+        <class>
+          <autobind>True</autobind>
+          <classname>DIGITAL_AUDIO_CLIENT</classname>
+        </class>
+      </classes>
+    </connection>
+  </connections>
+
+</devicedata>
