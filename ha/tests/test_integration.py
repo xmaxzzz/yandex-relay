@@ -54,6 +54,7 @@ def mock_driver(aioclient_mock, info_status: int = 200) -> None:
     aioclient_mock.post(f"{BASE}/duck", json={"room_id": 21, "result": "ducked", "ducked": True})
     aioclient_mock.post(f"{BASE}/volume_step", json={"room_id": 21, "result": "step", "volume": 45})
     aioclient_mock.post(f"{BASE}/volume_level", json={"room_id": 21, "result": "absolute", "volume": 38})
+    aioclient_mock.post(f"{BASE}/alarms", json={"room_id": 21, "next": "2026-09-29 07:30"})
 
 
 def add_station(hass: HomeAssistant, *, area: str | None = "Офис", state: str = "playing",
@@ -464,3 +465,80 @@ async def test_volume_settings_backed_up_and_sent_on_pairing(hass, aioclient_moc
     assert calls_to(aioclient_mock, "/pair")[0][2]["volume_cfg"] == cfg
     await hass.config_entries.async_unload(entry.entry_id)
     await hass.async_block_till_done()
+
+
+# --- alarms (0.4.0) -------------------------------------------------------------
+
+def add_station_calendar(hass, station, *, disabled=False) -> str:
+    """Put the station on a device together with an AlexxIT alarm calendar."""
+    from homeassistant.helpers import device_registry as dr
+    yentry = MockConfigEntry(domain="yandex_station", unique_id="yandex-account")
+    yentry.add_to_hass(hass)
+    dev = dr.async_get(hass).async_get_or_create(config_entry_id=yentry.entry_id,
+                                                identifiers={("yandex_station", "dev-office")})
+    ent_reg = er.async_get(hass)
+    ent_reg.async_update_entity(station, device_id=dev.id)
+    cal = ent_reg.async_get_or_create(
+        "calendar", "yandex_station", "dev-office_calendar", device_id=dev.id,
+        suggested_object_id="yandex_station_dev_office_calendar",
+        disabled_by=er.RegistryEntryDisabler.INTEGRATION if disabled else None)
+    return cal.entity_id
+
+
+def fake_calendar(*events):
+    from types import SimpleNamespace
+    return SimpleNamespace(events=list(events))
+
+
+def alarm_event(hh, mm, uid, rrule=None, summary="Будильник"):
+    from datetime import datetime, timedelta, timezone
+    from types import SimpleNamespace
+    start = datetime(2026, 9, 29, hh, mm, tzinfo=timezone(timedelta(hours=3)))
+    return SimpleNamespace(start=start, end=start + timedelta(minutes=1), summary=summary, uid=uid, rrule=rrule)
+
+
+async def test_alarms_sent_once_and_on_change(hass, aioclient_mock, relay) -> None:
+    entry, station, _ = relay
+    add_station_calendar(hass, station)
+    hub = entry.runtime_data
+    cal = fake_calendar(alarm_event(7, 30, "w", "FREQ=WEEKLY;BYDAY=MO,TU,WE,TH,FR"),
+                        alarm_event(9, 0, "o"))
+    with patch.object(hub, "_calendar_entity", return_value=cal):
+        await hub.sync_alarms()
+        await hub.sync_alarms()                               # unchanged: not sent again
+        assert [c[2] for c in calls_to(aioclient_mock, "/alarms")] == [{"room_id": 21, "alarms": [
+            {"id": "o", "time": "09:00", "enabled": True, "date": "2026-09-29"},
+            {"id": "w", "time": "07:30", "enabled": True, "days": [1, 2, 3, 4, 5]}]}]
+        cal.events.pop()                                      # "Алиса, удали будильник"
+        await hub.sync_alarms()
+    assert calls_to(aioclient_mock, "/alarms")[-1][2] == {"room_id": 21, "alarms": [
+        {"id": "w", "time": "07:30", "enabled": True, "days": [1, 2, 3, 4, 5]}]}
+
+
+async def test_alarms_without_calendar(hass, aioclient_mock, relay) -> None:
+    entry, station, _ = relay
+    hub = entry.runtime_data
+    await hub.sync_alarms()                                   # station has no calendar at all
+    assert calls_to(aioclient_mock, "/alarms") == []
+    add_station_calendar(hass, station, disabled=True)
+    await hub.sync_alarms()                                   # disabled calendar = no alarms
+    assert [c[2] for c in calls_to(aioclient_mock, "/alarms")] == [{"room_id": 21, "alarms": []}]
+
+
+async def test_alarm_calendar_not_loaded_yet(hass, aioclient_mock, relay) -> None:
+    entry, station, _ = relay
+    add_station_calendar(hass, station)
+    await entry.runtime_data.sync_alarms()
+    assert calls_to(aioclient_mock, "/alarms") == []
+
+
+async def test_alarm_event_from_driver(hass, aioclient_mock, relay, hass_client_no_auth) -> None:
+    entry, station, _ = relay
+    seen = []
+    hass.bus.async_listen("c4_relay_alarm", lambda e: seen.append(e.data))
+    client = await hass_client_no_auth()
+    await client.post(f"/api/webhook/{HOOK}", json={"event": "alarm", "room_id": 21, "phase": "prewake",
+                                                    "alarm_id": "w", "time": "2026-09-29 07:30"})
+    await hass.async_block_till_done()
+    assert seen == [{"room_id": 21, "room": "Офис", "station": station, "phase": "prewake",
+                     "alarm_id": "w", "time": "2026-09-29 07:30"}]

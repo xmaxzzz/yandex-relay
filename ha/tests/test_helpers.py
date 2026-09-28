@@ -100,3 +100,20 @@ def test_extract_directives_anywhere():
 ])
 def test_classify_volume_directives(directives, before, expected):
     assert helpers.classify_volume_directives(directives, before) == expected
+
+
+class _Ev:
+    def __init__(self, start, summary="Будильник", uid="a1", rrule=None):
+        self.start, self.summary, self.uid, self.rrule = start, summary, uid, rrule
+
+
+def test_alarm_from_event():
+    from datetime import date, datetime, timedelta, timezone
+    tz = timezone(timedelta(hours=3))
+    start = datetime(2026, 9, 29, 7, 30, tzinfo=tz)
+    assert helpers.alarm_from_event(_Ev(start, rrule="FREQ=WEEKLY;BYDAY=FR,MO,TU,WE,TH")) == {
+        "id": "a1", "time": "07:30", "enabled": True, "days": [1, 2, 3, 4, 5]}
+    assert helpers.alarm_from_event(_Ev(start, summary="Выключен", uid="b")) == {
+        "id": "b", "time": "07:30", "enabled": False, "date": "2026-09-29"}
+    assert helpers.alarm_from_event(_Ev(start, rrule="FREQ=WEEKLY")) is None
+    assert helpers.alarm_from_event(_Ev(date(2026, 9, 29))) is None      # all-day: not an alarm

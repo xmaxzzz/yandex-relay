@@ -1,5 +1,5 @@
 -- ============================================================
--- Yandex Relay  Control4 Driver  v0.3.0
+-- Yandex Relay  Control4 Driver  v0.4.0
 --
 -- Plays the music a Yandex Station has started into the Control4 room the
 -- station is bound to. The station stays the queue master (via AlexxIT
@@ -9,6 +9,16 @@
 -- Design, protocol and stages: docs/DESIGN.md in the yandex-relay repo.
 --
 -- Changelog:
+--   v0.4.0 - Alarms. HA sends each room's station alarms (/alarms, from the
+--            AlexxIT alarm calendar); the driver keeps the schedule on the
+--            controller clock and fires per-room events "<Room>: подготовка
+--            к пробуждению" (Pre-wake min before) and "<Room>: будильник",
+--            sets the variable "<Room>: следующий будильник" and tells HA
+--            (alarm webhook). Music in the room at the ring rises from Min
+--            to the room level over Ramp min; a voice/keypad change stops
+--            the ramp. New per-room settings "Alarm: Pre-wake min",
+--            "Alarm: Ramp min" (backed up in HA with the volume ones),
+--            "Alarm: Next"; actions "Alarm: Test Pre-wake / Test Alarm".
 --   v0.3.0 - /volume_step and /volume_level: c4_relay now sends the volume
 --            command Alice actually executed (Glagol sound_set_level), since
 --            the synced station volume is unreliable while the station is
@@ -60,7 +70,7 @@
 --            selection events pushed to the Home Assistant webhook.
 -- ============================================================
 
-local DRIVER_VERSION  = "0.3.0"
+local DRIVER_VERSION  = "0.4.0"
 local PROXY           = 5001
 local DIGITAL_AUDIO   = 100002   -- Digital Audio device (same id TuneIn watches)
 local DA_ROOM_MAP_VAR = 1009     -- its room<->queue map variable (XML)
@@ -74,7 +84,8 @@ local SERVER_CHECK_MS = 10000    -- bridge must report ONLINE this soon after st
 local SERVER_RETRY_MS = 30000    -- then retry this often until it does
 local DUCK_MAX_MS     = 30000    -- a duck HA never releases is lifted after this
 -- Per-room volume defaults (Composer "Volume:" properties override them per room).
-local VOL_DEFAULTS    = { step = 5, max = 70, min = 5, duck = "Lower", duck_level = 30 }
+local VOL_DEFAULTS    = { step = 5, max = 70, min = 5, duck = "Lower", duck_level = 30,
+                          prewake = 10, ramp = 2 }
 local VOL_NO_ROOM     = "-"
 
 -- ============================================================
@@ -558,6 +569,8 @@ local function SelectStream(r, url)
     }, "COMMAND")
 end
 
+local OnPlayStartedRef   -- alarms section, below
+
 local function PlayInRoom(r, b)
     local url = (b.url and b.url ~= "") and b.url or nil
     local fb  = (b.fallback_url and b.fallback_url ~= "") and b.fallback_url or nil
@@ -573,6 +586,7 @@ local function PlayInRoom(r, b)
     r.state = "starting"
     r.meta_ticks = 0
     SelectStream(r, url or fb)
+    if OnPlayStartedRef then OnPlayStartedRef(r.id) end
 end
 
 -- Ask the room itself to pause/stop/play, so digital audio handles the stream
@@ -740,6 +754,8 @@ local function VolCfg(roomId)
         min = tonumber(c.min) or VOL_DEFAULTS.min,
         duck = c.duck or VOL_DEFAULTS.duck,
         duck_level = tonumber(c.duck_level) or VOL_DEFAULTS.duck_level,
+        prewake = tonumber(c.prewake) or VOL_DEFAULTS.prewake,
+        ramp = tonumber(c.ramp) or VOL_DEFAULTS.ramp,
     }
 end
 
@@ -758,6 +774,17 @@ local function VolState(roomId)
     local v = gVol[roomId]
     if not v then v = {}; gVol[roomId] = v end
     return v
+end
+
+-- Alarm volume ramp per room (started in the alarms section).
+local gRamp = {}   -- [roomId] = {from, to, start, secs, last, timer} | {armed_until}
+
+local function StopRamp(roomId, why)
+    local rp = gRamp[roomId]
+    if not rp then return end
+    if rp.timer then rp.timer:Cancel() end
+    gRamp[roomId] = nil
+    if why and not rp.armed_until then Log("room " .. roomId .. ": alarm ramp stopped (" .. why .. ")") end
 end
 
 -- Find the room's current-volume variable once and listen to it.
@@ -812,6 +839,9 @@ end
 local function OnRoomVolumeVariable(roomId, value)
     local v = VolState(roomId)
     v.cur = tonumber(value) or v.cur
+    -- Someone turned the room up/down on a keypad: the ramp gives way.
+    local rp = gRamp[roomId]
+    if rp and rp.last and v.cur and math.abs(v.cur - rp.last) > 1 then StopRamp(roomId, "changed by hand") end
     ShowCurrentVolume(roomId)
     Webhook({ event = "volume", room_id = roomId, level = v.cur, ducked = v.ducked or false })
 end
@@ -836,6 +866,7 @@ end
 
 -- "Алиса, громче/тише": steps of the room's Step % from its current level.
 local function VolumeStep(roomId, steps)
+    StopRamp(roomId, "voice")
     local v, cfg = WatchRoomVolume(roomId), VolCfg(roomId)
     local base = v.ducked and v.saved or v.cur
     if not base then return "volume unknown", nil end
@@ -844,6 +875,7 @@ end
 
 -- "Алиса, громкость 5": 0..1 onto the room's min..max.
 local function VolumeLevel(roomId, level)
+    StopRamp(roomId, "voice")
     local cfg = VolCfg(roomId)
     WatchRoomVolume(roomId)
     level = Clamp(tonumber(level) or 0, 0, 1)
@@ -902,6 +934,8 @@ local function Duck(roomId, active)
 end
 
 -- Composer: "Volume: Room" picks the room, the fields below edit its settings.
+local ShowAlarmInfoRef   -- alarms section, below
+
 local function LoadVolumeProps(roomId)
     local cfg = VolCfg(roomId)
     gLoadingProps = true
@@ -910,9 +944,12 @@ local function LoadVolumeProps(roomId)
     C4:UpdateProperty("Volume: Min %", tostring(cfg.min))
     C4:UpdateProperty("Volume: Duck", cfg.duck)
     C4:UpdateProperty("Volume: Duck Level %", tostring(cfg.duck_level))
+    C4:UpdateProperty("Alarm: Pre-wake min", tostring(cfg.prewake))
+    C4:UpdateProperty("Alarm: Ramp min", tostring(cfg.ramp))
     gLoadingProps = false
     WatchRoomVolume(roomId)
     ShowCurrentVolume(roomId)
+    if ShowAlarmInfoRef then ShowAlarmInfoRef() end
 end
 
 local function RoomName(roomId)
@@ -936,10 +973,11 @@ UpdateVolumeSummary = function()
     local parts = {}
     for _, id in ipairs(ids) do
         local c = VolCfg(id)
-        parts[#parts + 1] = string.format("%s %d/%d/%d %s %d", RoomName(id), c.step, c.max, c.min,
-            c.duck, c.duck_level)
+        parts[#parts + 1] = string.format("%s %d/%d/%d %s %d wake %d/%d", RoomName(id), c.step, c.max,
+            c.min, c.duck, c.duck_level, c.prewake, c.ramp)
     end
-    C4:UpdateProperty("Volume: Summary", #parts > 0 and table.concat(parts, "; ") or "defaults 5/70/5 Lower 30")
+    C4:UpdateProperty("Volume: Summary", #parts > 0 and table.concat(parts, "; ")
+        or "defaults 5/70/5 Lower 30 wake 10/2")
 end
 
 UpdateVolumeRoomList = function(rooms)
@@ -976,6 +1014,7 @@ end
 local VOL_FIELDS = {
     ["Volume: Step %"] = "step", ["Volume: Max %"] = "max", ["Volume: Min %"] = "min",
     ["Volume: Duck"] = "duck", ["Volume: Duck Level %"] = "duck_level",
+    ["Alarm: Pre-wake min"] = "prewake", ["Alarm: Ramp min"] = "ramp",
 }
 
 -- Returns true when the property was a volume one.
@@ -983,7 +1022,7 @@ local function OnVolumeProperty(name)
     if name == "Volume: Room" then
         gVolSelected = gVolRoomByName[Properties["Volume: Room"]]
         if gVolSelected then LoadVolumeProps(gVolSelected)
-        else C4:UpdateProperty("Volume: Current", "") end
+        else C4:UpdateProperty("Volume: Current", ""); C4:UpdateProperty("Alarm: Next", "") end
         return true
     end
     local key = VOL_FIELDS[name]
@@ -1022,6 +1061,248 @@ local function TakeCurrentAs(key)
 end
 
 -- ============================================================
+-- ALARMS (station alarms -> Control4 room events)
+-- ============================================================
+-- HA sends each room's station alarms (read from the AlexxIT alarm calendar).
+-- The driver keeps the schedule itself, on the controller's clock, so alarms
+-- fire without HA too. Per room it adds (DESIGN §3.6):
+--   * event "<Room>: подготовка к пробуждению", Pre-wake minutes before;
+--   * event "<Room>: будильник" at the alarm time;
+--   * variable "<Room>: следующий будильник" ("YYYY-MM-DD HH:MM" or "").
+-- Control4's Wake agent has no API for its wake time, so scenes hang on these
+-- events instead. When the room plays at (or shortly after) the alarm, its
+-- volume rises from Min to its level over Ramp minutes.
+local ALARM_TICK_MS    = 15000
+local ALARM_GRACE      = 300     -- s: a ring this late (controller busy/restarted) still fires
+local ALARM_EVENT_BASE = 10000   -- event id = base + room * 10 + 1 (pre-wake) / 2 (ring)
+local ALARM_KEEP_FIRED = 2 * 86400
+local RAMP_TICK_MS     = 5000
+local RAMP_WAIT        = 180     -- s after the ring a starting stream still gets the ramp
+
+-- gAlarms["<roomId>"] = { {id, time = "HH:MM", days = {1..7 (Mon = 1)} | date = "YYYY-MM-DD", enabled}, ... }
+local gAlarms     = {}   -- persisted
+local gAlarmFired = {}   -- ["<kind>|<room>|<id>|<epoch>"] = epoch, persisted so a restart never repeats
+local gAlarmRooms = {}   -- [roomId] = {pre, ring, pre_name, ring_name, var, next}
+local gAlarmTimer = nil
+
+local function ParseHM(s)
+    local h, m = tostring(s or ""):match("^(%d%d?):(%d%d)$")
+    h, m = tonumber(h), tonumber(m)
+    if not h or h > 23 or m > 59 then return nil end
+    return h, m
+end
+
+local function IsoWeekday(t) return (os.date("*t", t).wday + 5) % 7 + 1 end
+
+-- First ring of the alarm at or after `from` (epoch), nil if none.
+local function NextRing(a, from)
+    if not a.enabled then return nil end
+    local h, m = ParseHM(a.time)
+    if not h then return nil end
+    if a.date then
+        local y, mo, d = tostring(a.date):match("^(%d%d%d%d)-(%d%d)-(%d%d)$")
+        if not y then return nil end
+        local t = os.time({ year = tonumber(y), month = tonumber(mo), day = tonumber(d),
+            hour = h, min = m, sec = 0 })
+        return t >= from and t or nil
+    end
+    if type(a.days) ~= "table" or #a.days == 0 then return nil end
+    for i = 0, 8 do
+        local day = os.date("*t", from + i * 86400)
+        local t = os.time({ year = day.year, month = day.month, day = day.day, hour = h, min = m, sec = 0 })
+        if t >= from and Contains(a.days, IsoWeekday(t)) then return t end
+    end
+    return nil
+end
+
+-- Next ring of the room that has not rung yet.
+local function RoomNextRing(roomId, from)
+    local best, bestAlarm = nil, nil
+    for _, a in ipairs(gAlarms[tostring(roomId)] or {}) do
+        local t = NextRing(a, from)
+        if t and gAlarmFired["ring|" .. roomId .. "|" .. tostring(a.id) .. "|" .. t] then t = NextRing(a, t + 1) end
+        if t and (not best or t < best) then best, bestAlarm = t, a end
+    end
+    return best, bestAlarm
+end
+
+local function NextAlarmText(roomId)
+    local t = RoomNextRing(roomId, os.time())
+    return t and os.date("%Y-%m-%d %H:%M", t) or ""
+end
+
+local function EnsureAlarmRoom(roomId)
+    roomId = tonumber(roomId)
+    if not roomId or gAlarmRooms[roomId] then return gAlarmRooms[roomId] end
+    local room = RoomName(roomId)
+    local base = ALARM_EVENT_BASE + roomId * 10
+    local ev = { pre = base + 1, ring = base + 2,
+        pre_name = room .. ": подготовка к пробуждению", ring_name = room .. ": будильник",
+        var = room .. ": следующий будильник" }
+    pcall(function() C4:AddEvent(ev.pre, ev.pre_name, "За Pre-wake минут до будильника станции") end)
+    pcall(function() C4:AddEvent(ev.ring, ev.ring_name, "Звонит будильник станции этой комнаты") end)
+    pcall(function() C4:AddVariable(ev.var, "", "STRING", true, false) end)
+    gAlarmRooms[roomId] = ev
+    Log("room " .. roomId .. ": alarm events " .. ev.pre .. "/" .. ev.ring .. " added")
+    return ev
+end
+
+-- Rooms bound in HA and rooms with alarms get the events and the variable.
+local function EnsureAlarmRooms()
+    for _, id in ipairs(gPairing.rooms or {}) do EnsureAlarmRoom(id) end
+    for key in pairs(gAlarms) do EnsureAlarmRoom(key) end
+end
+
+local function ShowAlarmInfo()
+    if not gVolSelected then C4:UpdateProperty("Alarm: Next", ""); return end
+    local n = #(gAlarms[tostring(gVolSelected)] or {})
+    local text = NextAlarmText(gVolSelected)
+    C4:UpdateProperty("Alarm: Next", n == 0 and "no alarms"
+        or ((text ~= "" and text or "none enabled") .. " (" .. n .. " alarm" .. (n == 1 and "" or "s") .. ")"))
+end
+
+local function UpdateAlarmInfo()
+    for roomId, ev in pairs(gAlarmRooms) do
+        local text = NextAlarmText(roomId)
+        if ev.next ~= text then
+            ev.next = text
+            pcall(function() C4:SetVariable(ev.var, text) end)
+        end
+    end
+    ShowAlarmInfo()
+end
+
+local function StartRamp(roomId)
+    local cfg = VolCfg(roomId)
+    local secs = (tonumber(cfg.ramp) or 0) * 60
+    StopRamp(roomId)
+    if secs <= 0 then return "off" end
+    local v = WatchRoomVolume(roomId)
+    local to = Clamp(Round(v.cur or cfg.max), cfg.min, cfg.max)
+    if to <= cfg.min then return "at min" end
+    local rp = { from = cfg.min, to = to, start = os.time(), secs = secs }
+    gRamp[roomId] = rp
+    rp.last = SetRoomVolume(roomId, rp.from)
+    LogI("room " .. roomId .. ": alarm volume " .. rp.from .. " -> " .. to .. " over " .. secs .. " s")
+    rp.timer = C4:SetTimer(RAMP_TICK_MS, function(timer)
+        if gRamp[roomId] ~= rp then timer:Cancel(); return end
+        local r = gRooms[roomId]
+        if not r or (r.state ~= "playing" and r.state ~= "starting") then StopRamp(roomId, "room stopped"); return end
+        if VolState(roomId).ducked then return end
+        local k = Clamp((os.time() - rp.start) / rp.secs, 0, 1)
+        local level = Round(rp.from + (rp.to - rp.from) * k)
+        if level ~= rp.last then rp.last = SetRoomVolume(roomId, level) end
+        if k >= 1 then StopRamp(roomId, "done") end
+    end, true)
+    return "ramp"
+end
+
+-- At the ring: ramp now if the room plays, else when a stream starts soon.
+local function ArmRamp(roomId)
+    local r = gRooms[roomId]
+    if r and (r.state == "playing" or r.state == "starting") then return StartRamp(roomId) end
+    gRamp[roomId] = { armed_until = os.time() + RAMP_WAIT }
+    return "armed"
+end
+
+OnPlayStartedRef = function(roomId)
+    local rp = gRamp[roomId]
+    if rp and rp.armed_until then
+        gRamp[roomId] = nil
+        if os.time() <= rp.armed_until then StartRamp(roomId) end
+    end
+end
+
+local function FireAlarm(roomId, kind, a, t)
+    local ev = EnsureAlarmRoom(roomId)
+    local id, name = ev.pre, ev.pre_name
+    if kind == "ring" then id, name = ev.ring, ev.ring_name end
+    LogI("room " .. roomId .. ": " .. kind .. " for alarm " .. tostring(a.id) .. " at " .. os.date("%Y-%m-%d %H:%M", t))
+    if not pcall(function() C4:FireEventByID(id) end) then
+        pcall(function() C4:FireEvent(name) end)
+    end
+    Webhook({ event = "alarm", room_id = roomId, phase = kind, alarm_id = a.id,
+        time = os.date("%Y-%m-%d %H:%M", t) })
+    if kind == "ring" then ArmRamp(roomId) end
+end
+
+local function CheckAlarms()
+    local now, changed = os.time(), false
+    for key, list in pairs(gAlarms) do
+        local roomId = tonumber(key)
+        local pre = (tonumber(VolCfg(roomId).prewake) or 0) * 60
+        for _, a in ipairs(list) do
+            local t = NextRing(a, now - ALARM_GRACE)
+            if t then
+                local tag = "|" .. roomId .. "|" .. tostring(a.id) .. "|" .. t
+                if pre > 0 and now >= t - pre and not gAlarmFired["prewake" .. tag] then
+                    gAlarmFired["prewake" .. tag] = t; changed = true
+                    FireAlarm(roomId, "prewake", a, t)
+                end
+                if now >= t and not gAlarmFired["ring" .. tag] then
+                    gAlarmFired["ring" .. tag] = t; changed = true
+                    FireAlarm(roomId, "ring", a, t)
+                end
+            end
+        end
+    end
+    for k, t in pairs(gAlarmFired) do
+        if tonumber(t) and t < now - ALARM_KEEP_FIRED then gAlarmFired[k] = nil; changed = true end
+    end
+    if changed then C4:PersistSetValue("alarms_fired", gAlarmFired) end
+    UpdateAlarmInfo()
+end
+
+local function StartAlarmTimer()
+    if gAlarmTimer then return end
+    gAlarmTimer = C4:SetTimer(ALARM_TICK_MS, function()
+        local ok, err = pcall(CheckAlarms)
+        if not ok then LogE("alarm check: " .. tostring(err)) end
+    end, true)
+end
+
+-- Only well-formed alarms are kept: time plus weekdays or a date.
+local function CleanAlarms(list)
+    local out = {}
+    for _, a in ipairs(type(list) == "table" and list or {}) do
+        if type(a) == "table" and ParseHM(a.time) then
+            local days = {}
+            for _, d in ipairs(type(a.days) == "table" and a.days or {}) do
+                d = tonumber(d)
+                if d and d >= 1 and d <= 7 and not Contains(days, d) then days[#days + 1] = d end
+            end
+            local date = type(a.date) == "string" and a.date:match("^%d%d%d%d%-%d%d%-%d%d$") or nil
+            if #days > 0 or date then
+                out[#out + 1] = { id = tostring(a.id or #out + 1), time = a.time, enabled = a.enabled ~= false,
+                    days = #days > 0 and days or nil, date = #days == 0 and date or nil }
+            end
+        end
+    end
+    return out
+end
+
+local function AlarmState(roomId)
+    return { room_id = roomId, alarms = gAlarms[tostring(roomId)] or {},
+        next = NextAlarmText(roomId) ~= "" and NextAlarmText(roomId) or nil }
+end
+
+local function SetRoomAlarms(roomId, list)
+    gAlarms[tostring(roomId)] = #list > 0 and list or nil
+    C4:PersistSetValue("alarms", gAlarms)
+    EnsureAlarmRoom(roomId)
+    LogI("room " .. roomId .. ": " .. #list .. " alarm(s), next " .. (NextAlarmText(roomId) ~= "" and NextAlarmText(roomId) or "none"))
+    CheckAlarms()
+end
+
+-- Composer actions: try the scenes without waiting for a real alarm.
+local function TestAlarm(kind)
+    if not gVolSelected then LogE("pick a room in \"Volume: Room\" first"); return end
+    FireAlarm(gVolSelected, kind, { id = "test" }, os.time())
+end
+
+ShowAlarmInfoRef = ShowAlarmInfo
+
+-- ============================================================
 -- HTTP API (HA -> driver)
 -- ============================================================
 local REASONS = { [200] = "OK", [400] = "Bad Request", [401] = "Unauthorized",
@@ -1036,6 +1317,7 @@ local function RoomState(r)
         title = t.title, artist = t.artist,
         source = r.track and (r.fallback_used and "fallback" or "direct") or nil,
         volume = v.cur, ducked = v.ducked or false,
+        next_alarm = NextAlarmText(r.id) ~= "" and NextAlarmText(r.id) or nil,
     }
 end
 
@@ -1074,6 +1356,8 @@ API["POST /pair"] = function(req, b)
     end
     UpdateVolumeRoomList(gProjectRooms)
     if gVolSelected then LoadVolumeProps(gVolSelected) end
+    EnsureAlarmRooms()
+    UpdateAlarmInfo()
     LogI("paired with " .. HostOf(wh))
     Webhook({ event = "hello" })
     return 200, { ok = true, version = DRIVER_VERSION, volume_cfg = gVolCfg, volume_restored = restored }
@@ -1155,6 +1439,22 @@ API["POST /volume"] = function(req, b)
     WatchRoomVolume(r.id)
     local cfg = VolCfg(r.id)
     return 200, { room_id = r.id, volume = SetRoomVolume(r.id, Clamp(tonumber(b.level) or 0, 0, cfg.max)) }
+end
+
+-- Replaces the room's alarm list (HA sends it whenever the calendar changes).
+API["POST /alarms"] = function(req, b)
+    local roomId = tonumber(b.room_id)
+    if not roomId or type(b.alarms) ~= "table" then return 400, { error = "room_id and alarms required" } end
+    SetRoomAlarms(roomId, CleanAlarms(b.alarms))
+    return 200, AlarmState(roomId)
+end
+
+API["GET /alarms"] = function(req)
+    local rid = tonumber(req.query.room_id)
+    if rid then return 200, AlarmState(rid) end
+    local all = {}
+    for key in pairs(gAlarms) do all[#all + 1] = AlarmState(tonumber(key)) end
+    return 200, { rooms = all }
 end
 
 API["GET /state"] = function(req)
@@ -1539,6 +1839,10 @@ function ExecuteCommand(sCommand, tParams)
         TakeCurrentAs("max")
     elseif action == "VolMinFromCurrent" then
         TakeCurrentAs("min")
+    elseif action == "AlarmTestPrewake" then
+        TestAlarm("prewake")
+    elseif action == "AlarmTestRing" then
+        TestAlarm("ring")
     end
 end
 
@@ -1574,11 +1878,18 @@ function OnDriverLateInit()
     gVolCfg = type(vc) == "table" and vc or {}
     local br = C4:PersistGetValue("bound_rooms")
     gPairing.rooms = type(br) == "table" and br or {}
+    local al = C4:PersistGetValue("alarms")
+    gAlarms = type(al) == "table" and al or {}
+    local af = C4:PersistGetValue("alarms_fired")
+    gAlarmFired = type(af) == "table" and af or {}
 
     C4:SendToProxy(PROXY, "ENABLE_DRIVER", {}, "COMMAND")
     OnRoomMap(C4:GetVariable(DIGITAL_AUDIO, DA_ROOM_MAP_VAR))
     C4:RegisterVariableListener(DIGITAL_AUDIO, DA_ROOM_MAP_VAR)
     DiscoverRooms()
+    EnsureAlarmRooms()
+    CheckAlarms()
+    StartAlarmTimer()
     StartServer()
     LogI("v" .. DRIVER_VERSION .. " ready, " .. #gProjectRooms .. " rooms, paired="
         .. tostring(gPairing.webhook ~= nil))
@@ -1597,4 +1908,7 @@ if YANDEX_RELAY_TEST then
     YANDEX_RELAY_TEST.project_rooms = function() return gProjectRooms end
     YANDEX_RELAY_TEST.vol = gVol
     YANDEX_RELAY_TEST.vol_cfg = function(id) return VolCfg(id) end
+    YANDEX_RELAY_TEST.alarms = function() return gAlarms end
+    YANDEX_RELAY_TEST.ramp = gRamp
+    YANDEX_RELAY_TEST.check_alarms = CheckAlarms
 end

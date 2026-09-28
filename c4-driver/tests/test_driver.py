@@ -98,6 +98,12 @@ class Driver:
         return self.g.YANDEX_RELAY_TEST.rooms[rid]
 
 
+def other_timers(d):
+    """Active timers except the alarm scheduler's 15 s tick (always running)."""
+    ts = d.g.TIMERS_ACTIVE()
+    return [ts[i] for i in range(1, len(ts) + 1) if ts[i].ms != 15000]
+
+
 def play_body(key="t1", url="https://cdn/t1.mp3", fallback="http://ha:8123/api/yandex_station/x.mp3"):
     return {"room_id": 12, "url": url, "fallback_url": fallback, "title": "Тест",
             "artist": "Queen", "album": "A", "image": "https://img/1.jpg",
@@ -111,7 +117,7 @@ class Boot(unittest.TestCase):
         self.assertEqual(len(code), 8)
         self.assertEqual(d.calls("CreateServer")[0]["port"], 18765)
         self.assertIn("2: Гостиная & кухня, Спальня", d.prop("Rooms Found"))
-        self.assertEqual(d.prop("Driver Version"), "0.3.0")
+        self.assertEqual(d.prop("Driver Version"), "0.4.0")
         self.assertEqual(d.g.PERSIST["pairing_code"], code)
         self.assertEqual(d.calls("RegisterVariableListener")[0]["var"], 1009)
 
@@ -137,7 +143,7 @@ class Http(unittest.TestCase):
     def test_info(self):
         code, body = self.d.http("GET", "/info")
         self.assertEqual(code, 200)
-        self.assertEqual(body["version"], "0.3.0")
+        self.assertEqual(body["version"], "0.4.0")
         self.assertFalse(body["paired"])
 
     def test_split_packets(self):
@@ -153,7 +159,7 @@ class Http(unittest.TestCase):
         self.assertEqual(code, 200)
         self.assertEqual(self.d.prop("Paired With"), "ha:8123")
         self.assertEqual(self.d.g.PERSIST["webhook"], "http://ha:8123/api/webhook/abc")
-        self.assertEqual(self.d.webhooks("hello")[0]["driver_version"], "0.3.0")
+        self.assertEqual(self.d.webhooks("hello")[0]["driver_version"], "0.4.0")
         self.assertEqual(self.d.calls("urlPost")[0]["url"], "http://ha:8123/api/webhook/abc")
 
     def test_pair_rejects_bad_url(self):
@@ -214,7 +220,7 @@ class Playback(unittest.TestCase):
         for _ in range(10):
             self.d.fire_timers()
         self.assertEqual(len(self.d.proxy_cmds("UPDATE_MEDIA_INFO")) - n0, 8 * 3)
-        self.assertEqual(len(self.d.g.TIMERS_ACTIVE()), 0)
+        self.assertEqual(len(other_timers(self.d)), 0)
 
     def test_fallback_on_early_failure(self):
         self.start()
@@ -711,7 +717,183 @@ class V030(unittest.TestCase):
         ev = self.d.webhooks("volume_cfg")[-1]
         self.assertEqual(ev["volume_cfg"]["13"]["max"], 50)
         self.assertEqual(self.d.prop("Volume: Summary"),
-                         "Гостиная & кухня 5/70/5 Lower 30; Спальня 5/50/5 Lower 30")
+                         "Гостиная & кухня 5/70/5 Lower 30 wake 10/2; Спальня 5/50/5 Lower 30 wake 10/2")
+
+
+class Alarms(unittest.TestCase):
+    """Station alarms -> per-room events, variable, volume ramp (v0.4.0)."""
+
+    WEEKDAYS = {"id": "a1", "time": "07:00", "days": [1, 2, 3, 4, 5], "enabled": True}
+
+    def setUp(self):
+        self.d = Driver()
+        self.d.http("POST", "/pair", {"webhook_url": "http://ha:8123/api/webhook/abc", "rooms": [12]})
+        self.at(2026, 9, 28, 6, 40)          # Monday
+        self.d.clear()
+
+    def at(self, y, mo, d, h, mi, s=0):
+        self.d.set_time(self.d.lua.eval(f"os.time({{year={y},month={mo},day={d},hour={h},min={mi},sec={s}}})"))
+
+    def alarms(self, *alarms, room=12):
+        return self.d.http("POST", "/alarms", {"room_id": room, "alarms": list(alarms)})
+
+    def fired(self):
+        return [c["id"] for c in self.d.calls("FireEventByID")]
+
+    def var(self, room_name="Гостиная & кухня"):
+        return self.d.g.VARS[room_name + ": следующий будильник"]
+
+    def levels(self, room=12):
+        return [int(c["params"]["LEVEL"]) for c in self.d.calls("SendToDevice")
+                if c["id"] == room and c["cmd"] == "SET_VOLUME_LEVEL"]
+
+    def play(self):
+        self.d.http("POST", "/play", play_body())
+        self.d.proxy("INTERNET_RADIO_SELECTED", QUEUE_ID=512, ROOM_ID=12, QUEUE_INFO="t1")
+
+    def test_bound_room_gets_events_and_variable(self):
+        d = Driver()
+        d.http("POST", "/pair", {"webhook_url": "http://ha:8123/api/webhook/abc", "rooms": [12]})
+        events = {c["id"]: c["name"] for c in d.calls("AddEvent")}
+        self.assertEqual(events, {10121: "Гостиная & кухня: подготовка к пробуждению",
+                                  10122: "Гостиная & кухня: будильник"})
+        self.assertEqual([c["name"] for c in d.calls("AddVariable")],
+                         ["Гостиная & кухня: следующий будильник"])
+
+    def test_weekday_alarm_prewake_then_ring(self):
+        code, body = self.alarms(self.WEEKDAYS)
+        self.assertEqual(code, 200)
+        self.assertEqual(body["next"], "2026-09-28 07:00")
+        self.assertEqual(self.var(), "2026-09-28 07:00")
+        self.at(2026, 9, 28, 6, 49)
+        self.d.fire_timers()
+        self.assertEqual(self.fired(), [])
+        self.at(2026, 9, 28, 6, 50)
+        self.d.fire_timers()
+        self.d.fire_timers()
+        self.assertEqual(self.fired(), [10121])                 # once
+        self.at(2026, 9, 28, 7, 0, 10)
+        self.d.fire_timers()
+        self.assertEqual(self.fired(), [10121, 10122])
+        self.assertEqual(self.var(), "2026-09-29 07:00")
+        phases = [(w["phase"], w["alarm_id"]) for w in self.d.webhooks("alarm")]
+        self.assertEqual(phases, [("prewake", "a1"), ("ring", "a1")])
+
+    def test_weekend_skipped(self):
+        self.at(2026, 10, 3, 8, 0)             # Saturday
+        self.assertEqual(self.alarms(self.WEEKDAYS)[1]["next"], "2026-10-05 07:00")
+
+    def test_one_off_and_disabled(self):
+        self.alarms({"id": "b", "time": "09:00", "date": "2026-09-29"},
+                    {"id": "c", "time": "06:45", "days": [1, 2, 3, 4, 5, 6, 7], "enabled": False})
+        self.assertEqual(self.var(), "2026-09-29 09:00")
+        self.at(2026, 9, 28, 6, 45)
+        self.d.fire_timers()
+        self.assertEqual(self.fired(), [])
+        self.at(2026, 9, 29, 9, 0)
+        self.d.fire_timers()
+        self.assertEqual(self.fired(), [10121, 10122])      # pre-wake overdue: both, in order
+        self.assertEqual(self.var(), "")
+
+    def test_restart_does_not_repeat(self):
+        self.alarms(self.WEEKDAYS)
+        self.at(2026, 9, 28, 7, 0)
+        self.d.fire_timers()
+        self.d.g.OnDriverLateInit()
+        self.at(2026, 9, 28, 7, 2)
+        self.d.fire_timers()
+        self.assertEqual(self.fired(), [10121, 10122])
+
+    def test_late_alarm_within_grace_only(self):
+        self.at(2026, 9, 28, 7, 3)
+        self.alarms(self.WEEKDAYS)
+        self.assertEqual(self.fired(), [10121, 10122])
+        d = Driver()
+        d.http("POST", "/pair", {"webhook_url": "http://ha:8123/api/webhook/abc", "rooms": [12]})
+        self.d = d
+        self.at(2026, 9, 28, 7, 10)
+        self.alarms(self.WEEKDAYS)
+        self.assertEqual(self.fired(), [])
+        self.assertEqual(self.var(), "2026-09-29 07:00")
+
+    def test_prewake_setting_per_room(self):
+        self.d.g.PROPS["Volume: Room"] = "Гостиная & кухня"
+        self.d.g.OnPropertyChanged("Volume: Room")
+        self.assertEqual(self.d.prop("Alarm: Pre-wake min"), "10")
+        self.d.g.PROPS["Alarm: Pre-wake min"] = "0"
+        self.d.g.OnPropertyChanged("Alarm: Pre-wake min")
+        self.assertEqual(self.d.webhooks("volume_cfg")[-1]["volume_cfg"]["12"]["prewake"], 0)
+        self.alarms(self.WEEKDAYS)
+        self.assertEqual(self.d.prop("Alarm: Next"), "2026-09-28 07:00 (1 alarm)")
+        self.at(2026, 9, 28, 7, 0)
+        self.d.fire_timers()
+        self.assertEqual(self.fired(), [10122])
+
+    def test_ramp_when_room_plays_at_ring(self):
+        self.play()
+        self.alarms(self.WEEKDAYS)
+        self.at(2026, 9, 28, 7, 0)
+        self.d.clear()
+        self.d.fire_timers()
+        self.assertEqual(self.levels(), [5])                   # from Min
+        self.at(2026, 9, 28, 7, 1)
+        self.d.fire_timers()
+        self.assertEqual(self.levels()[-1], 23)                 # halfway to 40
+        self.at(2026, 9, 28, 7, 2)
+        self.d.fire_timers()
+        self.assertEqual(self.levels()[-1], 40)
+        self.assertIsNone(self.d.g.YANDEX_RELAY_TEST.ramp[12])
+
+    def test_ramp_waits_for_stream_and_voice_stops_it(self):
+        self.alarms(self.WEEKDAYS)
+        self.at(2026, 9, 28, 7, 0)
+        self.d.fire_timers()
+        self.assertEqual(self.levels(), [])                    # room silent: only armed
+        self.at(2026, 9, 28, 7, 1)
+        self.d.clear()
+        self.play()
+        self.assertEqual(self.levels(), [5])
+        self.d.http("POST", "/volume_step", {"room_id": 12, "steps": 1})
+        self.assertEqual(self.levels(), [5, 10])
+        self.at(2026, 9, 28, 7, 3)
+        self.d.fire_timers()
+        self.assertEqual(self.levels(), [5, 10])
+
+    def test_keypad_change_stops_ramp(self):
+        self.play()
+        self.alarms(self.WEEKDAYS)
+        self.at(2026, 9, 28, 7, 0)
+        self.d.fire_timers()
+        self.d.g.OnWatchedVariableChanged(12, 1011, "5")       # our own level coming back
+        self.assertIsNotNone(self.d.g.YANDEX_RELAY_TEST.ramp[12])
+        self.d.g.OnWatchedVariableChanged(12, 1011, "30")      # someone on a keypad
+        self.assertIsNone(self.d.g.YANDEX_RELAY_TEST.ramp[12])
+
+    def test_ramp_too_late_after_ring(self):
+        self.alarms(self.WEEKDAYS)
+        self.at(2026, 9, 28, 7, 0)
+        self.d.fire_timers()
+        self.at(2026, 9, 28, 7, 10)
+        self.d.clear()
+        self.play()
+        self.assertEqual(self.levels(), [])
+
+    def test_test_actions(self):
+        self.d.g.PROPS["Volume: Room"] = "Гостиная & кухня"
+        self.d.g.OnPropertyChanged("Volume: Room")
+        for action in ("AlarmTestPrewake", "AlarmTestRing"):
+            self.d.g.ExecuteCommand("LUA_ACTION", self.d.lua.table_from({"ACTION": action}))
+        self.assertEqual(self.fired(), [10121, 10122])
+
+    def test_bad_and_malformed(self):
+        self.assertEqual(self.d.http("POST", "/alarms", {"room_id": 12})[0], 400)
+        code, body = self.alarms({"id": "x", "time": "25:00", "days": [1]}, {"id": "y", "time": "07:00"},
+                                 {"id": "z", "time": "7:30", "days": [0, 3, 9]})
+        self.assertEqual(code, 200)
+        self.assertEqual(body["next"], "2026-09-30 07:30")      # only z, Wednesday
+        self.assertEqual(self.d.http("GET", "/alarms?room_id=12")[1]["alarms"][0]["id"], "z")
+        self.alarms()
+        self.assertIsNone(self.d.g.YANDEX_RELAY_TEST.alarms()["12"])
 
 
 class Actions(unittest.TestCase):

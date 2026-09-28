@@ -5,6 +5,8 @@ from __future__ import annotations
 import base64
 import json
 import re
+from datetime import datetime
+from typing import Any
 from urllib.parse import urlparse
 
 
@@ -157,6 +159,39 @@ def classify_volume_directives(directives: list[dict], before: float | None) -> 
             return ("step", new - prev)
         return ("absolute", max(0.0, min(1.0, new / 10)))
     return None
+
+
+RRULE_DAYS = ["MO", "TU", "WE", "TH", "FR", "SA", "SU"]
+ALARM_OFF_SUMMARY = "Выключен"   # AlexxIT calendar: summary of a disabled alarm
+
+
+def alarm_from_event(event: Any) -> dict | None:
+    """One AlexxIT alarm-calendar event (one station alarm) as a driver alarm.
+
+    AlexxIT keeps one event per alarm (calendar.py alarm_to_event): start is the
+    next ring (or the last one of a disabled repeating alarm), rrule
+    "FREQ=WEEKLY;BYDAY=MO,TU,..." for repeating alarms, summary "Выключен" when
+    the alarm is off, uid = alarm_id. The time is the station's local time.
+    Returns {id, time "HH:MM", enabled, days [1..7, Mon = 1] | date "YYYY-MM-DD"}.
+    """
+    start = getattr(event, "start", None)
+    if not isinstance(start, datetime):
+        return None
+    alarm: dict[str, Any] = {
+        "id": str(getattr(event, "uid", None) or start.isoformat()),
+        "time": start.strftime("%H:%M"),
+        "enabled": getattr(event, "summary", "") != ALARM_OFF_SUMMARY,
+    }
+    rrule = getattr(event, "rrule", None)
+    if rrule:
+        parts = dict(p.split("=", 1) for p in str(rrule).split(";") if "=" in p)
+        days = sorted({RRULE_DAYS.index(d) + 1 for d in parts.get("BYDAY", "").split(",") if d in RRULE_DAYS})
+        if not days:
+            return None
+        alarm["days"] = days
+    else:
+        alarm["date"] = start.strftime("%Y-%m-%d")
+    return alarm
 
 
 def room_stop_pauses_station(event: str, state: str | None) -> bool:

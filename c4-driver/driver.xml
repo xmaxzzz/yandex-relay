@@ -6,8 +6,8 @@
   <name>Yandex Relay</name>
   <model>Yandex Relay</model>
   <created>09/28/2026 00:00</created>
-  <modified>09/28/2026 23:21</modified>
-  <version>11</version>
+  <modified>09/28/2026 23:54</modified>
+  <version>12</version>
   <control>lua_gen</control>
   <controlmethod>IP</controlmethod>
   <driver>DriverWorks</driver>
@@ -115,6 +115,28 @@
         <readonly>false</readonly>
       </property>
       <property>
+        <name>Alarm: Pre-wake min</name>
+        <type>RANGED_INTEGER</type>
+        <minimum>0</minimum>
+        <maximum>60</maximum>
+        <default>10</default>
+        <readonly>false</readonly>
+      </property>
+      <property>
+        <name>Alarm: Ramp min</name>
+        <type>RANGED_INTEGER</type>
+        <minimum>0</minimum>
+        <maximum>15</maximum>
+        <default>2</default>
+        <readonly>false</readonly>
+      </property>
+      <property>
+        <name>Alarm: Next</name>
+        <type>STRING</type>
+        <default></default>
+        <readonly>true</readonly>
+      </property>
+      <property>
         <name>Debug Mode</name>
         <type>LIST</type>
         <items>
@@ -127,7 +149,7 @@
       <property>
         <name>Driver Version</name>
         <type>STRING</type>
-        <default>0.3.0</default>
+        <default>0.4.0</default>
         <readonly>true</readonly>
       </property>
     </properties>
@@ -152,6 +174,14 @@
       <action>
         <name>Volume: Set Min from Current</name>
         <command>VolMinFromCurrent</command>
+      </action>
+      <action>
+        <name>Alarm: Test Pre-wake</name>
+        <command>AlarmTestPrewake</command>
+      </action>
+      <action>
+        <name>Alarm: Test Alarm</name>
+        <command>AlarmTestRing</command>
       </action>
     </actions>
     <commands/>

@@ -82,5 +82,8 @@ class RelayClient:
     async def volume_level(self, room_id: int, level: float) -> dict[str, Any]:
         return await self._request("POST", "/volume_level", {"room_id": room_id, "level": level})
 
+    async def alarms(self, room_id: int, alarms: list[dict]) -> dict[str, Any]:
+        return await self._request("POST", "/alarms", {"room_id": room_id, "alarms": alarms})
+
     async def duck(self, room_id: int, active: bool) -> dict[str, Any]:
         return await self._request("POST", "/duck", {"room_id": room_id, "active": active})

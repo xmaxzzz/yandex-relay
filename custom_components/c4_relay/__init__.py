@@ -4,7 +4,9 @@ AlexxIT YandexStation streams a station's music to a media_player chosen as the
 station's source. This integration provides one such media_player per Control4
 room, forwards play_media to the Yandex Relay driver on the controller, and
 turns the driver's webhook events (panel buttons, room state) into station
-commands. Design and protocol: docs/DESIGN.md in the yandex-relay repo.
+commands. It also hands each room its stations' alarms (AlexxIT alarm
+calendar), which the driver turns into Control4 events.
+Design and protocol: docs/DESIGN.md in the yandex-relay repo.
 """
 
 from __future__ import annotations
@@ -21,6 +23,7 @@ from homeassistant.config_entries import ConfigEntry
 from homeassistant.const import CONF_HOST, CONF_PORT, EVENT_HOMEASSISTANT_STARTED, Platform
 from homeassistant.core import CoreState, Event, HomeAssistant, callback
 from homeassistant.exceptions import ConfigEntryAuthFailed, ConfigEntryNotReady
+from homeassistant.helpers import entity_registry as er
 from homeassistant.helpers.aiohttp_client import async_get_clientsession
 from homeassistant.helpers.storage import Store
 from homeassistant.helpers.event import (
@@ -40,6 +43,7 @@ from .const import (
     YANDEX_DOMAIN,
 )
 from .helpers import (
+    alarm_from_event,
     classify_volume_directives,
     extract_directives,
     room_stop_pauses_station,
@@ -56,6 +60,8 @@ PLATFORMS = [Platform.MEDIA_PLAYER, Platform.SWITCH]
 SOURCE_CHECK_DELAY = 10  # s after HA start before stations are pointed at their rooms
 HOOK_CHECK_INTERVAL = timedelta(seconds=60)  # re-attach after AlexxIT reconnects/reloads
 EVENT_VINS = "c4_relay_vins"
+EVENT_ALARM = "c4_relay_alarm"
+ALARM_SYNC_INTERVAL = timedelta(seconds=30)  # AlexxIT polls the alarms about once a minute
 
 
 class RelayHub:
@@ -80,6 +86,8 @@ class RelayHub:
         # HA's copy of the driver's per-room volume settings (restored on re-add).
         self.store: Store = Store(hass, 1, f"{DOMAIN}.{entry.entry_id}")
         self.volume_cfg: dict = {}
+        self._alarms_sent: dict[int, list[dict]] = {}
+        self._calendar_hint: set[str] = set()
 
     # --- bindings ---------------------------------------------------------
     def station_for_room(self, room_id: int | None) -> str | None:
@@ -195,6 +203,63 @@ class RelayHub:
         if isinstance(state.get("volume"), (int, float)):
             self._station_volume[station] = float(state["volume"])
 
+    # --- alarms (AlexxIT alarm calendar -> driver schedule) ------------------
+    def _calendar_of(self, station: str) -> tuple[str | None, bool]:
+        """The station's AlexxIT alarm calendar: (entity_id, disabled)."""
+        ent_reg = er.async_get(self.hass)
+        st = ent_reg.async_get(station)
+        if st is None or st.device_id is None:
+            return None, False
+        for e in er.async_entries_for_device(ent_reg, st.device_id, include_disabled_entities=True):
+            if e.domain == "calendar" and e.platform == YANDEX_DOMAIN:
+                return e.entity_id, e.disabled_by is not None
+        return None, False
+
+    def _calendar_entity(self, entity_id: str) -> Any:
+        try:
+            return self.hass.data["entity_components"]["calendar"].get_entity(entity_id)
+        except (KeyError, AttributeError):
+            return None
+
+    async def sync_alarms(self) -> None:
+        """Send every bound room its stations' alarms when they changed.
+
+        AlexxIT's calendar keeps all alarms of a station in memory (one event
+        each); its state only shows the next one. A disabled calendar means
+        "no alarms" for that station, one not loaded yet is skipped.
+        """
+        per_room: dict[int, list[dict]] = {}
+        for station, room in self.bindings.items():
+            calendar, disabled = self._calendar_of(station)
+            if calendar is None:
+                continue
+            if disabled:
+                if station not in self._calendar_hint:
+                    self._calendar_hint.add(station)
+                    _LOGGER.info("Alarms of %s are not passed to Control4: enable %s", station, calendar)
+                per_room.setdefault(room, [])
+                continue
+            ent = self._calendar_entity(calendar)
+            if ent is None:
+                continue
+            alarms = per_room.setdefault(room, [])
+            for event in getattr(ent, "events", None) or []:
+                alarm = alarm_from_event(event)
+                if alarm is not None:
+                    alarms.append(alarm)
+        for room, alarms in per_room.items():
+            alarms = sorted(alarms, key=lambda a: a["id"])
+            if self._alarms_sent.get(room) == alarms:
+                continue
+            try:
+                resp = await self.client.alarms(room, alarms)
+            except RelayError as err:
+                _LOGGER.warning("alarms for room %s not sent: %s", room, err)
+                continue
+            self._alarms_sent[room] = alarms
+            _LOGGER.info("Room %s: %d alarm(s) sent to Control4, next %s", room, len(alarms),
+                         resp.get("next") or "none")
+
     async def save_volume_cfg(self, cfg: dict) -> None:
         if cfg and cfg != self.volume_cfg:
             self.volume_cfg = cfg
@@ -251,6 +316,12 @@ class RelayHub:
             return
         elif event == "volume_cfg" and isinstance(evt.get("volume_cfg"), dict):
             await self.save_volume_cfg(evt["volume_cfg"])
+            return
+        elif event == "alarm":
+            self.hass.bus.async_fire(EVENT_ALARM, {
+                "room_id": room, "room": self.rooms.get(room), "station": self.station_for_room(room),
+                "phase": evt.get("phase"), "alarm_id": evt.get("alarm_id"), "time": evt.get("time"),
+            })
             return
 
         station = self.station_for_room(room)
@@ -334,6 +405,12 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
 
     async def _check_sources(_now: Any) -> None:
         await hub.ensure_sources()
+        await hub.sync_alarms()
+
+    async def _sync_alarms(_now: Any) -> None:
+        await hub.sync_alarms()
+
+    entry.async_on_unload(async_track_time_interval(hass, _sync_alarms, ALARM_SYNC_INTERVAL))
 
     @callback
     def _check_later(_: Any = None) -> None:

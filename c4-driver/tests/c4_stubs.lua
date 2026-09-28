@@ -76,6 +76,14 @@ function C4:GetDeviceVariables(id)
         [1012] = { name = "IS_MUTED", value = "0" },
     }
 end
+function C4:AddEvent(id, name, desc) rec("AddEvent", { id = id, name = name, desc = desc }) end
+function C4:FireEventByID(id) rec("FireEventByID", { id = id }) end
+function C4:FireEvent(name) rec("FireEvent", { name = name }) end
+VARS = {}
+function C4:AddVariable(name, value, vtype, ro, hidden)
+    rec("AddVariable", { name = name, value = value, vtype = vtype }); VARS[name] = value; return true
+end
+function C4:SetVariable(name, value) rec("SetVariable", { name = name, value = value }); VARS[name] = value end
 function C4:RegisterVariableListener(dev, var) rec("RegisterVariableListener", { dev = dev, var = var }) end
 function C4:url()
     local o = {}
