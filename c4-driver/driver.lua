@@ -1,5 +1,5 @@
 -- ============================================================
--- Yandex Relay  Control4 Driver  v0.1.6
+-- Yandex Relay  Control4 Driver  v0.1.7
 --
 -- Plays the music a Yandex Station has started into the Control4 room the
 -- station is bound to. The station stays the queue master (via AlexxIT
@@ -9,6 +9,10 @@
 -- Design, protocol and stages: docs/DESIGN.md in the yandex-relay repo.
 --
 -- Changelog:
+--   v0.1.7 - Pause/stop (from HA and from the panel) switch the room off:
+--            digital audio's PAUSE on an internet radio queue left the room
+--            sounding (site test with the station, 2026-09-28). The OFF that
+--            follows our own ROOM_OFF is not echoed to HA.
 --   v0.1.6 - driver.xml: Digital Audio / Digital Audio Client classes autobind
 --            to Digital Media on add (TuneIn pattern), so no manual
 --            connections; unused Audio End-Point (AUDIO_SELECTION) removed.
@@ -38,7 +42,7 @@
 --            selection events pushed to the Home Assistant webhook.
 -- ============================================================
 
-local DRIVER_VERSION  = "0.1.6"
+local DRIVER_VERSION  = "0.1.7"
 local PROXY           = 5001
 local DIGITAL_AUDIO   = 100002   -- Digital Audio device (same id TuneIn watches)
 local DA_ROOM_MAP_VAR = 1009     -- its room<->queue map variable (XML)
@@ -552,13 +556,19 @@ end
 -- Ask the room itself to pause/stop/play, so digital audio handles the stream
 -- the same way a panel press would. The command comes back to us through the
 -- proxy; the suppress flag stops us from echoing it to HA as a user action.
-local function RoomCommand(r, cmd)
+local function RoomCommand(r, cmd, intent)
     r.suppress = cmd
-    if cmd == "PAUSE" then r.intent = "pause"
-    elseif cmd == "STOP" then r.intent = "stop"
-    else r.intent = nil end
+    r.intent = intent
     C4:SendToDevice(r.id, cmd, {})
     C4:SetTimer(3000, function() if r.suppress == cmd then r.suppress = nil end end)
+end
+
+-- Pause and stop switch the room off. Digital audio's PAUSE on an internet
+-- radio queue only changes the reported state, the room keeps sounding (site
+-- 2026-09-28: STATE=PAUSE while the music went on); ROOM_OFF silences it. The
+-- queue is gone afterwards, so a later resume restarts the track.
+local function RoomOff(r, intent)
+    RoomCommand(r, "ROOM_OFF", intent)
 end
 
 -- STOP/END right after a start means the stream did not open: retry once with
@@ -583,7 +593,7 @@ local function Resume(r)
     if not r.track then return "none" end
     if r.state == "playing" or r.state == "starting" then return "none" end
     if r.state == "paused" and r.queueId then
-        RoomCommand(r, "PLAY")
+        RoomCommand(r, "PLAY", nil)
         return "in_place"
     end
     r.state = "starting"
@@ -721,14 +731,14 @@ end
 API["POST /pause"] = function(req, b)
     local r = GetRoom(b.room_id)
     if not r then return 400, { error = "room_id required" } end
-    if r.state == "playing" or r.state == "starting" then RoomCommand(r, "PAUSE") end
+    if r.state == "playing" or r.state == "starting" then RoomOff(r, "pause") end
     return 200, RoomState(r)
 end
 
 API["POST /stop"] = function(req, b)
     local r = GetRoom(b.room_id)
     if not r then return 400, { error = "room_id required" } end
-    if r.state == "playing" or r.state == "starting" then RoomCommand(r, "STOP") end
+    if r.state == "playing" or r.state == "starting" then RoomOff(r, "stop") end
     return 200, RoomState(r)
 end
 
@@ -893,8 +903,9 @@ end
 
 local function Transport(cmd, tP)
     local r = RoomFromParams(tP)
-    if r and r.suppress == cmd then
-        r.suppress = nil
+    -- Our own room command (or the PAUSE/STOP a ROOM_OFF may cause) coming back.
+    if r and (r.suppress == cmd or (r.suppress == "ROOM_OFF" and (cmd == "PAUSE" or cmd == "STOP"))) then
+        if r.suppress == cmd then r.suppress = nil end
         Log("room " .. r.id .. ": own " .. cmd .. " came back, not forwarded")
         return LetDigitalAudioHandle(tP)
     end
@@ -916,8 +927,10 @@ local function Transport(cmd, tP)
         Webhook({ event = "transport", room_id = rid, action = "play", resume = how })
         return Handled(true)
     elseif cmd == "PAUSE" or cmd == "STOP" then
-        if r then r.intent = (cmd == "PAUSE") and "pause" or "stop" end
         Webhook({ event = "transport", room_id = rid, action = cmd:lower() })
+        if r and (r.state == "playing" or r.state == "starting") then
+            RoomOff(r, (cmd == "PAUSE") and "pause" or "stop")
+        end
         return LetDigitalAudioHandle(tP)
     end
 end
@@ -928,8 +941,21 @@ function RFP.STOP(tP)     return Transport("STOP", tP) end
 function RFP.SKIP_FWD(tP) return Transport("SKIP_FWD", tP) end
 function RFP.SKIP_REV(tP) return Transport("SKIP_REV", tP) end
 
+-- OFF arrives without a room id. After our own ROOM_OFF it is swallowed; a
+-- room switched off by the user shows up as its queue stopping or leaving,
+-- which already pauses the station.
 function RFP.OFF(tP)
     local r = RoomFromParams(tP)
+    if not r then
+        for _, x in pairs(gRooms) do
+            if x.suppress == "ROOM_OFF" then r = x; break end
+        end
+    end
+    if r and r.suppress == "ROOM_OFF" then
+        r.suppress = nil
+        Log("room " .. r.id .. ": own ROOM_OFF came back, not forwarded")
+        return
+    end
     if r then r.intent = "stop" end
     Webhook({ event = "transport", room_id = r and r.id or nil, action = "off" })
 end

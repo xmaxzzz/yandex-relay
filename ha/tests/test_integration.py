@@ -190,6 +190,15 @@ async def test_transport_commands_to_driver(hass, aioclient_mock, relay) -> None
     assert calls[-1] == (station, "media_next_track", {})
 
 
+async def test_station_resume_after_room_off_seeks_station(hass, aioclient_mock, relay) -> None:
+    entry, station, calls = relay
+    aioclient_mock.clear_requests()                   # first match wins: restart before defaults
+    aioclient_mock.post(f"{BASE}/resume", json={"room_id": 21, "state": "starting", "resume": "restart"})
+    mock_driver(aioclient_mock)
+    await hass.services.async_call("media_player", "media_play", {"entity_id": player_id(hass, entry)}, blocking=True)
+    assert calls == [(station, "media_seek", {"seek_position": 0})]
+
+
 async def test_webhook_panel_buttons_drive_station(hass, relay, hass_client_no_auth) -> None:
     _, station, calls = relay
     client = await hass_client_no_auth()

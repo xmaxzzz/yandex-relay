@@ -144,7 +144,12 @@ class RelayRoomPlayer(MediaPlayerEntity):
         await self._call(self._hub.client.play(payload))
 
     async def async_media_play(self) -> None:
-        await self._call(self._hub.client.resume(self.room_id))
+        # The station resumed. After a pause the room was switched off, so the
+        # driver restarts the track; seek the station back to 0 to match.
+        resp = await self._call(self._hub.client.resume(self.room_id))
+        station = self._hub.station_for_room(self.room_id)
+        if resp.get("resume") == "restart" and station:
+            await self._hub.station_call(station, "media_seek", {"seek_position": 0})
 
     async def async_media_pause(self) -> None:
         await self._call(self._hub.client.pause(self.room_id))

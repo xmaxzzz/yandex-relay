@@ -111,7 +111,7 @@ class Boot(unittest.TestCase):
         self.assertEqual(len(code), 8)
         self.assertEqual(d.calls("CreateServer")[0]["port"], 18765)
         self.assertIn("2: Гостиная & кухня, Спальня", d.prop("Rooms Found"))
-        self.assertEqual(d.prop("Driver Version"), "0.1.6")
+        self.assertEqual(d.prop("Driver Version"), "0.1.7")
         self.assertEqual(d.g.PERSIST["pairing_code"], code)
         self.assertEqual(d.calls("RegisterVariableListener")[0]["var"], 1009)
 
@@ -137,7 +137,7 @@ class Http(unittest.TestCase):
     def test_info(self):
         code, body = self.d.http("GET", "/info")
         self.assertEqual(code, 200)
-        self.assertEqual(body["version"], "0.1.6")
+        self.assertEqual(body["version"], "0.1.7")
         self.assertFalse(body["paired"])
 
     def test_split_packets(self):
@@ -153,7 +153,7 @@ class Http(unittest.TestCase):
         self.assertEqual(code, 200)
         self.assertEqual(self.d.prop("Paired With"), "ha:8123")
         self.assertEqual(self.d.g.PERSIST["webhook"], "http://ha:8123/api/webhook/abc")
-        self.assertEqual(self.d.webhooks("hello")[0]["driver_version"], "0.1.6")
+        self.assertEqual(self.d.webhooks("hello")[0]["driver_version"], "0.1.7")
         self.assertEqual(self.d.calls("urlPost")[0]["url"], "http://ha:8123/api/webhook/abc")
 
     def test_pair_rejects_bad_url(self):
@@ -262,9 +262,11 @@ class Playback(unittest.TestCase):
         self.d.set_time(1100)
         self.d.http("POST", "/pause", {"room_id": 12})
         dev = self.d.calls("SendToDevice")[0]
-        self.assertEqual((dev["id"], dev["cmd"]), (12, "PAUSE"))
-        ret = self.d.proxy("PAUSE", ROOM_ID=12)          # the room forwards it back to us
-        self.assertIn("<handled>false</handled>", ret)    # digital audio stops the stream
+        # Site 2026-09-28: digital audio PAUSE left the room sounding; room off silences it.
+        self.assertEqual((dev["id"], dev["cmd"]), (12, "ROOM_OFF"))
+        ret = self.d.proxy("PAUSE", ROOM_ID=12)          # if the room reports it back
+        self.assertIn("<handled>false</handled>", ret)
+        self.assertIsNone(self.d.proxy("OFF"))            # OFF {} after our ROOM_OFF
         self.assertEqual(self.d.webhooks("transport"), [])
         self.d.proxy("QUEUE_STATE_CHANGED", QUEUE_ID=501, STATE="STOP", QUEUE_INFO="t1")
         self.assertEqual(self.d.room(12)["state"], "paused")
@@ -384,7 +386,23 @@ class Playback(unittest.TestCase):
         self.start()
         self.assertIn("<handled>false</handled>", self.d.proxy("PAUSE", ROOM_ID=12))
         self.assertIn("<handled>false</handled>", self.d.proxy("STOP", ROOM_ID=12))
-        self.assertEqual([w["action"] for w in self.d.webhooks("transport")], ["pause", "stop"])
+        self.assertEqual([w["action"] for w in self.d.webhooks("transport")], ["pause"])
+        self.assertEqual([(c["id"], c["cmd"]) for c in self.d.calls("SendToDevice")], [(12, "ROOM_OFF")])
+
+    def test_panel_stop_turns_room_off(self):
+        self.start()
+        self.d.proxy("STOP", ROOM_ID=12)
+        self.assertEqual([(c["id"], c["cmd"]) for c in self.d.calls("SendToDevice")], [(12, "ROOM_OFF")])
+        self.d.proxy("QUEUE_STATE_CHANGED", QUEUE_ID=501, STATE="STOP", QUEUE_INFO="t1")
+        self.assertEqual(self.d.room(12)["state"], "stopped")
+
+    def test_user_room_off_reaches_ha(self):
+        self.start()
+        self.d.set_time(1100)
+        self.d.proxy("OFF")                               # user switched the room off
+        self.assertEqual(self.d.webhooks("transport")[-1]["action"], "off")
+        self.d.proxy("QUEUE_STATE_CHANGED", QUEUE_ID=501, STATE="STOP", QUEUE_INFO="t1")
+        self.assertEqual(self.d.webhooks("state")[-1]["state"], "stopped")
 
     def test_navigator_pause_stop_return_nothing(self):
         # Site 2026-09-28: handled=false on navigator PAUSE/STOP left the stream playing.
@@ -392,7 +410,8 @@ class Playback(unittest.TestCase):
         self.assertIsNone(self.d.proxy("PAUSE", ROOMID=12, NAVID="nav", SEQ=3))
         self.assertIsNone(self.d.proxy("STOP", ROOMID=12, NAVID="nav", SEQ=4))
         acts = [w["action"] for w in self.d.webhooks("transport")]
-        self.assertEqual(acts, ["pause", "stop"])
+        self.assertEqual(acts, ["pause"])                 # STOP right after is the room-off echo
+        self.assertEqual([c["cmd"] for c in self.d.calls("SendToDevice")], ["ROOM_OFF"])
 
     def test_panel_pause_is_not_a_failure(self):
         self.start()
