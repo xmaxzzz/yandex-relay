@@ -99,9 +99,9 @@ class Driver:
 
 
 def other_timers(d):
-    """Active timers except the alarm scheduler's 15 s tick (always running)."""
+    """Active timers except the always-running alarm (15 s) and HA watch (30 s) ticks."""
     ts = d.g.TIMERS_ACTIVE()
-    return [ts[i] for i in range(1, len(ts) + 1) if ts[i].ms != 15000]
+    return [ts[i] for i in range(1, len(ts) + 1) if ts[i].ms not in (15000, 30000)]
 
 
 def play_body(key="t1", url="https://cdn/t1.mp3", fallback="http://ha:8123/api/yandex_station/x.mp3"):
@@ -117,7 +117,7 @@ class Boot(unittest.TestCase):
         self.assertEqual(len(code), 8)
         self.assertEqual(d.calls("CreateServer")[0]["port"], 18765)
         self.assertIn("2: Гостиная & кухня, Спальня", d.prop("Rooms Found"))
-        self.assertEqual(d.prop("Driver Version"), "0.4.0")
+        self.assertEqual(d.prop("Driver Version"), "0.5.0")
         self.assertEqual(d.g.PERSIST["pairing_code"], code)
         self.assertEqual(d.calls("RegisterVariableListener")[0]["var"], 1009)
 
@@ -143,7 +143,7 @@ class Http(unittest.TestCase):
     def test_info(self):
         code, body = self.d.http("GET", "/info")
         self.assertEqual(code, 200)
-        self.assertEqual(body["version"], "0.4.0")
+        self.assertEqual(body["version"], "0.5.0")
         self.assertFalse(body["paired"])
 
     def test_split_packets(self):
@@ -159,7 +159,7 @@ class Http(unittest.TestCase):
         self.assertEqual(code, 200)
         self.assertEqual(self.d.prop("Paired With"), "ha:8123")
         self.assertEqual(self.d.g.PERSIST["webhook"], "http://ha:8123/api/webhook/abc")
-        self.assertEqual(self.d.webhooks("hello")[0]["driver_version"], "0.4.0")
+        self.assertEqual(self.d.webhooks("hello")[0]["driver_version"], "0.5.0")
         self.assertEqual(self.d.calls("urlPost")[0]["url"], "http://ha:8123/api/webhook/abc")
 
     def test_pair_rejects_bad_url(self):
@@ -670,12 +670,27 @@ class V030(unittest.TestCase):
         self.assertEqual(self.d.http("POST", "/volume_step", {"room_id": 12})[0], 400)
         self.assertEqual(self.d.http("POST", "/volume_level", {"room_id": 12})[0], 400)
 
-    def test_pairing_code_edits_are_undone(self):
+    def test_invalid_pairing_code_edits_are_undone(self):
         code = self.d.prop("Pairing Code")
-        self.d.g.PROPS["Pairing Code"] = "HACKED"
-        self.d.g.OnPropertyChanged("Pairing Code")
-        self.assertEqual(self.d.prop("Pairing Code"), code)
+        for bad in ("abc", "ПАРОЛЬ12", "AB-CD-EF-GH", ""):
+            self.d.g.PROPS["Pairing Code"] = bad
+            self.d.g.OnPropertyChanged("Pairing Code")
+            self.assertEqual(self.d.prop("Pairing Code"), code)
         self.assertEqual(self.d.http("GET", "/info")[0], 200)
+
+    def test_old_code_pasted_into_readded_driver(self):
+        self.pair()
+        old = self.d.prop("Pairing Code")
+        self.d.g.PROPS["Pairing Code"] = " abcd 2345 "
+        self.d.g.OnPropertyChanged("Pairing Code")
+        self.assertEqual(self.d.prop("Pairing Code"), "ABCD2345")
+        self.assertEqual(self.d.g.PERSIST["pairing_code"], "ABCD2345")
+        self.assertEqual(self.d.http("GET", "/info", key=old)[0], 401)
+        # HA with this code: heartbeat says "not paired", HA pairs again
+        code, body = self.d.http("POST", "/heartbeat", {"webhook_url": self.hook}, key="ABCD2345")
+        self.assertEqual((code, body["paired"]), (200, False))
+        self.d.http("POST", "/pair", {"webhook_url": self.hook}, key="ABCD2345")
+        self.assertTrue(self.d.http("POST", "/heartbeat", {"webhook_url": self.hook}, key="ABCD2345")[1]["paired"])
 
     def test_pairing_code_property_is_editable(self):
         with open(os.path.join(HERE, "..", "driver.xml"), encoding="utf-8") as f:
@@ -758,7 +773,7 @@ class Alarms(unittest.TestCase):
         self.assertEqual(events, {10121: "Гостиная & кухня: подготовка к пробуждению",
                                   10122: "Гостиная & кухня: будильник"})
         self.assertEqual([c["name"] for c in d.calls("AddVariable")],
-                         ["Гостиная & кухня: следующий будильник"])
+                         ["HA_ONLINE", "Гостиная & кухня: следующий будильник"])
 
     def test_weekday_alarm_prewake_then_ring(self):
         code, body = self.alarms(self.WEEKDAYS)
@@ -894,6 +909,65 @@ class Alarms(unittest.TestCase):
         self.assertEqual(self.d.http("GET", "/alarms?room_id=12")[1]["alarms"][0]["id"], "z")
         self.alarms()
         self.assertIsNone(self.d.g.YANDEX_RELAY_TEST.alarms()["12"])
+
+
+class HaLink(unittest.TestCase):
+    """Heartbeat, HA online/offline events (v0.5.0)."""
+
+    def setUp(self):
+        self.d = Driver()
+        self.hook = "http://ha:8123/api/webhook/abc"
+        self.d.set_time(1000)
+
+    def events(self):
+        return [c["name"] for c in self.d.calls("FireEvent")]
+
+    def test_unpaired_never_goes_offline(self):
+        self.assertEqual(self.d.prop("Home Assistant"), "not paired")
+        self.d.set_time(5000)
+        self.d.fire_timers()
+        self.assertEqual(self.events(), [])
+
+    def test_heartbeat_summary_and_offline_events(self):
+        self.d.http("POST", "/pair", {"webhook_url": self.hook})
+        body = self.d.http("POST", "/heartbeat", {"webhook_url": self.hook,
+                                                  "summary": "c4_relay 0.5.0, AlexxIT 3.19; Офис ok"})[1]
+        self.assertEqual(body, {"ok": True, "version": "0.5.0", "paired": True})
+        self.assertEqual(self.d.prop("Home Assistant"), "online · c4_relay 0.5.0, AlexxIT 3.19; Офис ok")
+        self.assertEqual(self.d.g.VARS["HA_ONLINE"], "1")
+        self.d.set_time(1170)
+        self.d.fire_timers()
+        self.assertEqual(self.events(), [])
+        self.d.set_time(1190)
+        self.d.fire_timers()
+        self.d.fire_timers()
+        self.assertEqual(self.events(), ["Home Assistant: связь потеряна"])
+        self.assertTrue(self.d.prop("Home Assistant").startswith("OFFLINE since "))
+        self.assertEqual(self.d.g.VARS["HA_ONLINE"], "0")
+        self.d.http("GET", "/state")                    # any request from HA
+        self.assertEqual(self.events(), ["Home Assistant: связь потеряна", "Home Assistant: связь восстановлена"])
+        self.assertEqual(self.d.g.VARS["HA_ONLINE"], "1")
+
+    def test_ha_silent_after_controller_boot(self):
+        self.d.http("POST", "/pair", {"webhook_url": self.hook})
+        self.d.g.OnDriverLateInit()                     # controller restarted, HA never came
+        self.d.set_time(1200)
+        self.d.fire_timers()
+        self.assertIn("Home Assistant: связь потеряна", self.events())
+
+    def test_rejected_request_is_no_sign_of_life(self):
+        self.d.http("POST", "/pair", {"webhook_url": self.hook})
+        self.d.set_time(1100)
+        self.d.http("GET", "/info", key="WRONG")
+        self.d.set_time(1190)
+        self.d.fire_timers()
+        self.assertEqual(self.events(), ["Home Assistant: связь потеряна"])
+
+    def test_events_declared_in_xml(self):
+        with open(os.path.join(HERE, "..", "driver.xml"), encoding="utf-8") as f:
+            xml = f.read()
+        self.assertIn("<name>Home Assistant: связь потеряна</name>", xml)
+        self.assertIn("<name>Home Assistant: связь восстановлена</name>", xml)
 
 
 class Actions(unittest.TestCase):

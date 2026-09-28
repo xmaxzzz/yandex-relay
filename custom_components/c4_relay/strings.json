@@ -47,5 +47,23 @@
       "invalid_auth": "Wrong pairing code: reconfigure the integration.",
       "no_stations": "No Yandex Stations found."
     }
+  },
+  "issues": {
+    "volume_fallback": {
+      "title": "Voice volume for {station} uses the fallback path",
+      "description": "Control4 Yandex Relay cannot read Alice's commands from {station} (AlexxIT YandexStation {alexxit}). This usually follows an AlexxIT update or a station without a local connection. \"Louder/quieter\" may now jump. Check that the station is in local mode, reload AlexxIT, and report the AlexxIT version if it persists."
+    },
+    "source_missing": {
+      "title": "{station} does not offer the Control4 player",
+      "description": "AlexxIT YandexStation {alexxit} does not list the Control4 room player as a stream target for {station}, so music is not relayed. Reload AlexxIT; if it persists, check \"Streaming music\" in the AlexxIT settings."
+    },
+    "pairing_rejected": {
+      "title": "The Control4 driver rejected the pairing code",
+      "description": "The Yandex Relay driver on {host} does not accept the code (it was probably re-added). Easiest: paste the previous code {code} into the new driver's \"Pairing Code\" property in Composer; Home Assistant pairs again within a minute. Or reconfigure the integration with the new code (offered automatically after 10 minutes)."
+    },
+    "driver_unreachable": {
+      "title": "The Control4 driver cannot be reached",
+      "description": "No answer from the Yandex Relay driver at {host}:{port} for 5 minutes. Check the controller, the driver's \"Bridge Status\" (ONLINE) and \"Bridge Port\". If the driver was re-added on another port, reconfigure the integration."
+    }
   }
 }

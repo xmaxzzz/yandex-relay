@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import json
 import logging
+import time
 from datetime import timedelta
 from typing import TYPE_CHECKING, Any
 
@@ -24,8 +25,10 @@ from homeassistant.const import CONF_HOST, CONF_PORT, EVENT_HOMEASSISTANT_STARTE
 from homeassistant.core import CoreState, Event, HomeAssistant, callback
 from homeassistant.exceptions import ConfigEntryAuthFailed, ConfigEntryNotReady
 from homeassistant.helpers import entity_registry as er
+from homeassistant.helpers import issue_registry as ir
 from homeassistant.helpers.aiohttp_client import async_get_clientsession
 from homeassistant.helpers.storage import Store
+from homeassistant.loader import async_get_integration
 from homeassistant.helpers.event import (
     async_call_later,
     async_track_state_change_event,
@@ -62,6 +65,10 @@ HOOK_CHECK_INTERVAL = timedelta(seconds=60)  # re-attach after AlexxIT reconnect
 EVENT_VINS = "c4_relay_vins"
 EVENT_ALARM = "c4_relay_alarm"
 ALARM_SYNC_INTERVAL = timedelta(seconds=30)  # AlexxIT polls the alarms about once a minute
+HEARTBEAT_INTERVAL = timedelta(seconds=60)   # the driver calls HA offline after 3 min of silence
+HEALTH_ISSUE_AFTER = 180       # s a station problem lasts before a Repairs issue
+UNREACHABLE_ISSUE_AFTER = 300  # s the driver is unreachable before a Repairs issue
+REAUTH_AFTER = 600             # s of a rejected code before the reauth flow starts
 
 
 class RelayHub:
@@ -88,6 +95,10 @@ class RelayHub:
         self.volume_cfg: dict = {}
         self._alarms_sent: dict[int, list[dict]] = {}
         self._calendar_hint: set[str] = set()
+        self.webhook_url: str = ""
+        self.versions: dict[str, str] = {}
+        self._since: dict[str, float] = {}     # Repairs issue key -> problem seen since
+        self._reauth_started = False
 
     # --- bindings ---------------------------------------------------------
     def station_for_room(self, room_id: int | None) -> str | None:
@@ -260,6 +271,106 @@ class RelayHub:
             _LOGGER.info("Room %s: %d alarm(s) sent to Control4, next %s", room, len(alarms),
                          resp.get("next") or "none")
 
+    # --- pairing and health (heartbeat) --------------------------------------
+    async def pair(self) -> None:
+        """Hand the driver our webhook, bound rooms and the volume settings copy."""
+        paired = await self.client.pair(self.webhook_url, sorted(set(self.bindings.values())), self.volume_cfg)
+        if paired.get("volume_restored"):
+            _LOGGER.info("Volume settings restored into the Control4 driver")
+        if isinstance(paired.get("volume_cfg"), dict):
+            await self.save_volume_cfg(paired["volume_cfg"])
+        self._alarms_sent.clear()   # a (re-)paired driver may have no alarms yet
+
+    def station_health(self, station: str) -> dict[str, Any]:
+        st = self.hass.states.get(station)
+        player = self.players.get(self.bindings.get(station))
+        calendar, disabled = self._calendar_of(station)
+        return {
+            "available": st is not None and st.state != "unavailable",
+            "volume": "directives" if self.hooked(station) else "fallback",
+            "source": (player is not None and st is not None
+                       and player.name in (st.attributes.get("source_list") or [])),
+            "calendar": "none" if calendar is None else ("off" if disabled else "on"),
+        }
+
+    def health_summary(self, health: dict[str, dict]) -> str:
+        """One line for the driver's "Home Assistant" property."""
+        rooms = []
+        for station, h in health.items():
+            name = self.rooms.get(self.bindings[station], str(self.bindings[station]))
+            problems = []
+            if not h["available"]:
+                problems.append("station unavailable")
+            else:
+                if h["volume"] == "fallback":
+                    problems.append("voice volume fallback")
+                if not h["source"] and self.enabled(station):
+                    problems.append("not a stream target")
+            if h["calendar"] != "on":
+                problems.append("no alarm calendar" if h["calendar"] == "none" else "alarm calendar off")
+            if not self.enabled(station):
+                problems.append("streaming off")
+            rooms.append(f"{name}: " + (", ".join(problems) if problems else "ok"))
+        head = f"c4_relay {self.versions.get(DOMAIN, '?')}, AlexxIT {self.versions.get(YANDEX_DOMAIN, '?')}"
+        return "; ".join([head, *rooms])
+
+    def _issue(self, key: str, active: bool, after: float, now: float,
+               placeholders: dict[str, str] | None = None) -> None:
+        """Raise a Repairs issue once a problem has lasted `after` s; clear it when gone."""
+        issue_id = f"{self.entry.entry_id}_{key}".replace(".", "_")
+        if not active:
+            if self._since.pop(key, None) is not None:
+                ir.async_delete_issue(self.hass, DOMAIN, issue_id)
+            return
+        since = self._since.setdefault(key, now)
+        if now - since >= after:
+            ir.async_create_issue(self.hass, DOMAIN, issue_id, is_fixable=False,
+                                  severity=ir.IssueSeverity.WARNING, translation_key=key.split(":")[0],
+                                  translation_placeholders=placeholders or {})
+
+    async def heartbeat(self, now: float | None = None) -> None:
+        """Tell the driver we are alive; check what AlexxIT updates may break.
+
+        A driver that answers paired=false (re-added with the old code) is
+        paired again. A rejected code raises a Repairs issue at once and starts
+        the reauth flow after REAUTH_AFTER, to leave time to paste the old code.
+        """
+        now = time.monotonic() if now is None else now
+        health = {station: self.station_health(station) for station in self.bindings}
+        for station, h in health.items():
+            ph = {"station": station, "alexxit": self.versions.get(YANDEX_DOMAIN, "?")}
+            self._issue(f"volume_fallback:{station}", h["available"] and h["volume"] == "fallback",
+                        HEALTH_ISSUE_AFTER, now, ph)
+            self._issue(f"source_missing:{station}", h["available"] and not h["source"] and self.enabled(station),
+                        HEALTH_ISSUE_AFTER, now, ph)
+        where = {"host": self.entry.data[CONF_HOST], "port": str(self.entry.data[CONF_PORT]),
+                 "code": self.entry.data[CONF_PAIRING_CODE]}
+        try:
+            resp = await self.client.heartbeat(self.webhook_url, self.health_summary(health))
+        except RelayAuthError:
+            self._issue("driver_unreachable", False, 0, now)
+            self._issue("pairing_rejected", True, 0, now, where)
+            if now - self._since["pairing_rejected"] >= REAUTH_AFTER and not self._reauth_started:
+                self._reauth_started = True
+                self.entry.async_start_reauth(self.hass)
+            return
+        except RelayError as err:
+            _LOGGER.debug("heartbeat failed: %s", err)
+            self._issue("driver_unreachable", True, UNREACHABLE_ISSUE_AFTER, now, where)
+            return
+        self._issue("driver_unreachable", False, 0, now)
+        self._issue("pairing_rejected", False, 0, now)
+        if resp.get("version"):
+            self.driver_version = resp["version"]
+        if resp.get("paired") is False:
+            _LOGGER.info("The Control4 driver is not paired with this HA (re-added?), pairing again")
+            try:
+                await self.pair()
+            except RelayError as err:
+                _LOGGER.warning("pairing again failed: %s", err)
+                return
+            await self.sync_alarms()
+
     async def save_volume_cfg(self, cfg: dict) -> None:
         if cfg and cfg != self.volume_cfg:
             self.volume_cfg = cfg
@@ -368,16 +479,17 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
 
     stored = await hub.store.async_load() or {}
     hub.volume_cfg = stored.get("volume_cfg") or {}
+    for domain in (DOMAIN, YANDEX_DOMAIN):
+        try:
+            hub.versions[domain] = str((await async_get_integration(hass, domain)).version or "?")
+        except Exception:  # not installed (tests) or broken manifest: only for the summary
+            hub.versions[domain] = "?"
 
-    webhook_url = entry.data[CONF_HA_URL].rstrip("/") + webhook.async_generate_path(webhook_id)
+    hub.webhook_url = entry.data[CONF_HA_URL].rstrip("/") + webhook.async_generate_path(webhook_id)
     try:
-        paired = await client.pair(webhook_url, sorted(set(hub.bindings.values())), hub.volume_cfg)
+        await hub.pair()
     except RelayError as err:
         raise ConfigEntryNotReady(f"pairing failed: {err}") from err
-    if paired.get("volume_restored"):
-        _LOGGER.info("Volume settings restored into the Control4 driver")
-    if isinstance(paired.get("volume_cfg"), dict):
-        await hub.save_volume_cfg(paired["volume_cfg"])
 
     await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)
 
@@ -406,6 +518,12 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     async def _check_sources(_now: Any) -> None:
         await hub.ensure_sources()
         await hub.sync_alarms()
+        await hub.heartbeat()
+
+    async def _heartbeat(_now: Any) -> None:
+        await hub.heartbeat()
+
+    entry.async_on_unload(async_track_time_interval(hass, _heartbeat, HEARTBEAT_INTERVAL))
 
     async def _sync_alarms(_now: Any) -> None:
         await hub.sync_alarms()
@@ -442,3 +560,6 @@ async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
 
 async def async_remove_entry(hass: HomeAssistant, entry: ConfigEntry) -> None:
     await Store(hass, 1, f"{DOMAIN}.{entry.entry_id}").async_remove()
+    for (domain, issue_id) in list(ir.async_get(hass).issues):
+        if domain == DOMAIN and issue_id.startswith(entry.entry_id):
+            ir.async_delete_issue(hass, DOMAIN, issue_id)

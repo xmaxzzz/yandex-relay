@@ -1,5 +1,5 @@
 -- ============================================================
--- Yandex Relay  Control4 Driver  v0.4.0
+-- Yandex Relay  Control4 Driver  v0.5.0
 --
 -- Plays the music a Yandex Station has started into the Control4 room the
 -- station is bound to. The station stays the queue master (via AlexxIT
@@ -9,6 +9,13 @@
 -- Design, protocol and stages: docs/DESIGN.md in the yandex-relay repo.
 --
 -- Changelog:
+--   v0.5.0 - Home Assistant link: /heartbeat (every 60 s from HA, with a
+--            health summary shown in "Home Assistant"); 3 min of silence
+--            fires "Home Assistant: связь потеряна", the next request
+--            "…восстановлена"; variable HA_ONLINE. The Pairing Code can be
+--            set by hand (6-32 letters/digits): paste the old code into a
+--            re-added driver and HA re-pairs by itself (heartbeat answers
+--            paired=false), no reconfiguration in HA.
 --   v0.4.0 - Alarms. HA sends each room's station alarms (/alarms, from the
 --            AlexxIT alarm calendar); the driver keeps the schedule on the
 --            controller clock and fires per-room events "<Room>: подготовка
@@ -70,7 +77,7 @@
 --            selection events pushed to the Home Assistant webhook.
 -- ============================================================
 
-local DRIVER_VERSION  = "0.4.0"
+local DRIVER_VERSION  = "0.5.0"
 local PROXY           = 5001
 local DIGITAL_AUDIO   = 100002   -- Digital Audio device (same id TuneIn watches)
 local DA_ROOM_MAP_VAR = 1009     -- its room<->queue map variable (XML)
@@ -1303,6 +1310,73 @@ end
 ShowAlarmInfoRef = ShowAlarmInfo
 
 -- ============================================================
+-- HOME ASSISTANT LINK (heartbeat)
+-- ============================================================
+-- HA calls /heartbeat every 60 s (with a short health summary); any
+-- authorised request counts as a sign of life. Silence for HA_TIMEOUT fires
+-- "Home Assistant: связь потеряна", the next request "…восстановлена"; the
+-- variable HA_ONLINE follows. Voice start needs HA, the rest of the driver
+-- (panel, volume, alarms) works on without it.
+local HA_TIMEOUT    = 180     -- s: three missed heartbeats
+local HA_CHECK_MS   = 30000
+local HA_EVENT_LOST = "Home Assistant: связь потеряна"
+local HA_EVENT_BACK = "Home Assistant: связь восстановлена"
+local gHa = { seen = nil, online = nil, since = nil, boot = nil, summary = "" }
+
+local function ShowHaStatus()
+    local text
+    if not gPairing.webhook then
+        text = "not paired"
+    elseif gHa.online == true then
+        text = "online" .. (gHa.summary ~= "" and (" · " .. gHa.summary) or "")
+    elseif gHa.online == false then
+        text = "OFFLINE since " .. os.date("%Y-%m-%d %H:%M", gHa.since)
+    else
+        text = "waiting for Home Assistant"
+    end
+    C4:UpdateProperty("Home Assistant", text)
+end
+
+local function SetHaOnline(online)
+    if gHa.online == online then return end
+    local was = gHa.online
+    gHa.online, gHa.since = online, os.time()
+    pcall(function() C4:SetVariable("HA_ONLINE", online and "1" or "0") end)
+    if online and was == false then
+        LogI("Home Assistant is back")
+        pcall(function() C4:FireEvent(HA_EVENT_BACK) end)
+    elseif not online then
+        LogE("no request from Home Assistant for " .. HA_TIMEOUT .. " s")
+        pcall(function() C4:FireEvent(HA_EVENT_LOST) end)
+    end
+    ShowHaStatus()
+end
+
+local function HaSeen()
+    gHa.seen = os.time()
+    SetHaOnline(true)
+end
+
+local function CheckHa()
+    if not gPairing.webhook or gHa.online == false then return end
+    if os.time() - (gHa.seen or gHa.boot or os.time()) > HA_TIMEOUT then SetHaOnline(false) end
+end
+
+local function StartHaWatch()
+    gHa.boot = os.time()
+    pcall(function() C4:AddVariable("HA_ONLINE", "0", "BOOL", true, false) end)
+    ShowHaStatus()
+    C4:SetTimer(HA_CHECK_MS, function() pcall(CheckHa) end, true)
+end
+
+-- Pairing Code typed in Composer: 6-32 letters/digits (spaces dropped, upper case).
+local function ValidCode(s)
+    s = tostring(s or ""):gsub("%s", ""):upper()
+    if #s >= 6 and #s <= 32 and s:match("^[A-Z0-9]+$") then return s end
+    return nil
+end
+
+-- ============================================================
 -- HTTP API (HA -> driver)
 -- ============================================================
 local REASONS = { [200] = "OK", [400] = "Bad Request", [401] = "Unauthorized",
@@ -1358,6 +1432,7 @@ API["POST /pair"] = function(req, b)
     if gVolSelected then LoadVolumeProps(gVolSelected) end
     EnsureAlarmRooms()
     UpdateAlarmInfo()
+    ShowHaStatus()
     LogI("paired with " .. HostOf(wh))
     Webhook({ event = "hello" })
     return 200, { ok = true, version = DRIVER_VERSION, volume_cfg = gVolCfg, volume_restored = restored }
@@ -1441,6 +1516,15 @@ API["POST /volume"] = function(req, b)
     return 200, { room_id = r.id, volume = SetRoomVolume(r.id, Clamp(tonumber(b.level) or 0, 0, cfg.max)) }
 end
 
+-- HA's sign of life. paired=false tells HA to pair again (driver re-added
+-- with the old Pairing Code, or unpaired).
+API["POST /heartbeat"] = function(req, b)
+    gHa.summary = type(b.summary) == "string" and b.summary:sub(1, 400) or ""
+    ShowHaStatus()
+    return 200, { ok = true, version = DRIVER_VERSION,
+        paired = gPairing.webhook ~= nil and gPairing.webhook == b.webhook_url }
+end
+
 -- Replaces the room's alarm list (HA sends it whenever the calendar changes).
 API["POST /alarms"] = function(req, b)
     local roomId = tonumber(b.room_id)
@@ -1503,6 +1587,7 @@ local function HandleRequest(h, req)
         LogE("rejected " .. req.method .. " " .. req.path .. ": bad pairing code")
         return SendResponse(h, 401, { error = "bad pairing code" })
     end
+    HaSeen()
     local fn = API[req.method .. " " .. req.path]
     if not fn then return SendResponse(h, 404, { error = "no such endpoint" }) end
     local b = {}
@@ -1822,6 +1907,8 @@ local function Unpair()
     gPairing.webhook = nil
     C4:PersistSetValue("webhook", "", true)
     C4:UpdateProperty("Paired With", "")
+    gHa.online, gHa.seen, gHa.summary = nil, nil, ""
+    ShowHaStatus()
 end
 
 function ExecuteCommand(sCommand, tParams)
@@ -1849,10 +1936,19 @@ end
 function OnPropertyChanged(name)
     if name == "Bridge Port" then StartServer(); return end
     if name == "Pairing Code" then
-        -- Editable only so Composer lets you select and copy it; edits are undone.
-        if Properties["Pairing Code"] ~= gPairing.code then
+        -- Copy it from here into HA, or paste the old code into a re-added
+        -- driver: HA then pairs again by itself. Anything invalid is undone.
+        local typed = Properties["Pairing Code"]
+        if typed == gPairing.code then return end
+        local code = ValidCode(typed)
+        if not code then
             C4:UpdateProperty("Pairing Code", gPairing.code or "")
-            LogI("Pairing Code is changed only by the \"Regenerate Pairing Code\" action")
+            LogI("Pairing Code must be 6-32 letters/digits; kept the current one")
+        elseif code == gPairing.code then
+            C4:UpdateProperty("Pairing Code", code)
+        else
+            SetPairingCode(code); Unpair()
+            LogI("Pairing Code set by hand; Home Assistant with this code pairs again within a minute")
         end
         return
     end
@@ -1890,6 +1986,7 @@ function OnDriverLateInit()
     EnsureAlarmRooms()
     CheckAlarms()
     StartAlarmTimer()
+    StartHaWatch()
     StartServer()
     LogI("v" .. DRIVER_VERSION .. " ready, " .. #gProjectRooms .. " rooms, paired="
         .. tostring(gPairing.webhook ~= nil))

@@ -82,6 +82,9 @@ class RelayClient:
     async def volume_level(self, room_id: int, level: float) -> dict[str, Any]:
         return await self._request("POST", "/volume_level", {"room_id": room_id, "level": level})
 
+    async def heartbeat(self, webhook_url: str, summary: str) -> dict[str, Any]:
+        return await self._request("POST", "/heartbeat", {"webhook_url": webhook_url, "summary": summary})
+
     async def alarms(self, room_id: int, alarms: list[dict]) -> dict[str, Any]:
         return await self._request("POST", "/alarms", {"room_id": room_id, "alarms": alarms})
 

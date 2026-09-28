@@ -6,8 +6,8 @@
   <name>Yandex Relay</name>
   <model>Yandex Relay</model>
   <created>09/28/2026 00:00</created>
-  <modified>09/28/2026 23:54</modified>
-  <version>12</version>
+  <modified>09/29/2026 00:04</modified>
+  <version>13</version>
   <control>lua_gen</control>
   <controlmethod>IP</controlmethod>
   <driver>DriverWorks</driver>
@@ -34,6 +34,12 @@
       </property>
       <property>
         <name>Paired With</name>
+        <type>STRING</type>
+        <default></default>
+        <readonly>true</readonly>
+      </property>
+      <property>
+        <name>Home Assistant</name>
         <type>STRING</type>
         <default></default>
         <readonly>true</readonly>
@@ -149,7 +155,7 @@
       <property>
         <name>Driver Version</name>
         <type>STRING</type>
-        <default>0.4.0</default>
+        <default>0.5.0</default>
         <readonly>true</readonly>
       </property>
     </properties>
@@ -264,7 +270,18 @@
     </UI>
   </capabilities>
 
-  <events/>
+  <events>
+    <event>
+      <id>1</id>
+      <name>Home Assistant: связь потеряна</name>
+      <description>Home Assistant молчит 3 минуты: голосовой запуск музыки не работает</description>
+    </event>
+    <event>
+      <id>2</id>
+      <name>Home Assistant: связь восстановлена</name>
+      <description>Home Assistant снова на связи</description>
+    </event>
+  </events>
 
   <connections>
     <connection>

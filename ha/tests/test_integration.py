@@ -55,6 +55,7 @@ def mock_driver(aioclient_mock, info_status: int = 200) -> None:
     aioclient_mock.post(f"{BASE}/volume_step", json={"room_id": 21, "result": "step", "volume": 45})
     aioclient_mock.post(f"{BASE}/volume_level", json={"room_id": 21, "result": "absolute", "volume": 38})
     aioclient_mock.post(f"{BASE}/alarms", json={"room_id": 21, "next": "2026-09-29 07:30"})
+    aioclient_mock.post(f"{BASE}/heartbeat", json={"ok": True, "version": "0.5.0", "paired": True})
 
 
 def add_station(hass: HomeAssistant, *, area: str | None = "Офис", state: str = "playing",
@@ -542,3 +543,94 @@ async def test_alarm_event_from_driver(hass, aioclient_mock, relay, hass_client_
     await hass.async_block_till_done()
     assert seen == [{"room_id": 21, "room": "Офис", "station": station, "phase": "prewake",
                      "alarm_id": "w", "time": "2026-09-29 07:30"}]
+
+
+# --- heartbeat, health, Repairs (0.5.0) ------------------------------------------
+
+def issue(hass, entry, key):
+    from homeassistant.helpers import issue_registry as ir
+    return ir.async_get(hass).async_get_issue(DOMAIN, f"{entry.entry_id}_{key}".replace(".", "_"))
+
+
+def remock(aioclient_mock, path, **kw):
+    """Replace one endpoint's answer (first registered match wins)."""
+    aioclient_mock.clear_requests()
+    aioclient_mock.post(f"{BASE}{path}", **kw)
+    mock_driver(aioclient_mock)
+
+
+async def test_heartbeat_carries_health_summary(hass, aioclient_mock, relay) -> None:
+    entry, station, _ = relay
+    set_station(hass, station, source="Control4 Офис", source_list=["Станция", "Control4 Офис"])
+    glagol, _, patcher = hook_fake_station(entry.runtime_data)
+    try:
+        await entry.runtime_data.heartbeat(now=0)
+    finally:
+        patcher.stop()
+    body = calls_to(aioclient_mock, "/heartbeat")[-1][2]
+    assert body["webhook_url"] == f"http://192.0.2.20:8123/api/webhook/{HOOK}"
+    assert body["summary"].endswith("; Офис: no alarm calendar")
+    assert body["summary"].startswith("c4_relay ")
+
+
+async def test_readded_driver_with_old_code_is_paired_again(hass, aioclient_mock, relay) -> None:
+    entry, station, _ = relay
+    remock(aioclient_mock, "/heartbeat", json={"ok": True, "version": "0.5.0", "paired": False})
+    await entry.runtime_data.heartbeat(now=0)
+    assert calls_to(aioclient_mock, "/pair")[0][2]["rooms"] == [21]
+
+
+async def test_rejected_code_issue_then_reauth(hass, aioclient_mock, relay) -> None:
+    entry, _, _ = relay
+    remock(aioclient_mock, "/heartbeat", status=401, json={"error": "bad pairing code"})
+    hub = entry.runtime_data
+    await hub.heartbeat(now=0)
+    found = issue(hass, entry, "pairing_rejected")
+    assert found is not None and found.translation_placeholders["code"] == "ABCD1234"
+    assert not hass.config_entries.flow.async_progress_by_handler(DOMAIN)
+    await hub.heartbeat(now=601)
+    await hass.async_block_till_done()
+    flows = hass.config_entries.flow.async_progress_by_handler(DOMAIN)
+    assert [f["context"]["source"] for f in flows] == ["reauth"]
+    remock(aioclient_mock, "/heartbeat", json={"ok": True, "paired": True})
+    await hub.heartbeat(now=660)                          # old code pasted: issue gone
+    assert issue(hass, entry, "pairing_rejected") is None
+
+
+async def test_unreachable_driver_issue_after_5_min(hass, aioclient_mock, relay) -> None:
+    import aiohttp
+    entry, _, _ = relay
+    remock(aioclient_mock, "/heartbeat", exc=aiohttp.ClientConnectionError())
+    hub = entry.runtime_data
+    await hub.heartbeat(now=0)
+    assert issue(hass, entry, "driver_unreachable") is None
+    await hub.heartbeat(now=300)
+    assert issue(hass, entry, "driver_unreachable") is not None
+
+
+async def test_alexxit_breakage_raises_issues(hass, aioclient_mock, relay) -> None:
+    entry, station, _ = relay
+    hub = entry.runtime_data
+    set_station(hass, station, source="Станция", source_list=["Станция"])   # no hook, no target
+    await hub.heartbeat(now=0)
+    assert issue(hass, entry, f"volume_fallback:{station}") is None
+    await hub.heartbeat(now=180)
+    assert issue(hass, entry, f"volume_fallback:{station}") is not None
+    assert issue(hass, entry, f"source_missing:{station}") is not None
+    set_station(hass, station, source="Control4 Офис", source_list=["Станция", "Control4 Офис"])
+    _, _, patcher = hook_fake_station(hub)
+    try:
+        await hub.heartbeat(now=240)
+    finally:
+        patcher.stop()
+    assert issue(hass, entry, f"volume_fallback:{station}") is None
+    assert issue(hass, entry, f"source_missing:{station}") is None
+
+
+async def test_unavailable_station_raises_no_alexxit_issue(hass, aioclient_mock, relay) -> None:
+    entry, station, _ = relay
+    set_station(hass, station, state="unavailable")
+    await entry.runtime_data.heartbeat(now=0)
+    await entry.runtime_data.heartbeat(now=500)
+    assert issue(hass, entry, f"volume_fallback:{station}") is None
+    assert "Офис: station unavailable" in calls_to(aioclient_mock, "/heartbeat")[-1][2]["summary"]
