@@ -317,3 +317,35 @@ async def test_webhook_room_volume_shown_on_player(hass, relay, hass_client_no_a
     await hass.async_block_till_done()
     assert hass.states.get(player_id(hass, entry)).attributes["volume_level"] == 0.33
     assert calls == []                  # volume changes on the C4 side never touch the station
+
+
+# --- Glagol diagnostic hook (0.2.1) ---------------------------------------------
+
+async def test_glagol_hook_passes_messages_and_reports_directives(hass, relay) -> None:
+    from types import SimpleNamespace
+    from pytest_homeassistant_custom_component.common import async_capture_events
+
+    entry, station, _ = relay
+    seen = []
+    glagol = SimpleNamespace(update_handler=lambda data: seen.append(data))
+    fake = SimpleNamespace(glagol=glagol)
+    hub = entry.runtime_data
+    events = async_capture_events(hass, "c4_relay_vins")
+    with patch.object(hub, "_station_entity", return_value=fake):
+        hub.hook_stations()
+        hub.hook_stations()                          # second call must not double-wrap
+    msg = {"state": {"aliceState": "SPEAKING", "volume": 0.3, "playing": True},
+           "vinsResponse": {"response": {"directives": [{"name": "sound_louder"}]}}}
+    glagol.update_handler(msg)
+    await hass.async_block_till_done()
+    assert seen == [msg]                             # AlexxIT still gets every message
+    assert events[0].data == {"entity_id": station,
+                              "directives": [{"name": "sound_louder", "payload": None}]}
+    glagol.update_handler(None)                      # disconnect notification passes through
+    assert seen[-1] is None
+
+
+async def test_glagol_hook_survives_missing_alexxit(hass, relay) -> None:
+    entry, _, _ = relay
+    with patch.object(entry.runtime_data, "_station_entity", return_value=None):
+        entry.runtime_data.hook_stations()           # only a warning, no exception

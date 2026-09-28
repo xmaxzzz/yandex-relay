@@ -9,7 +9,9 @@ commands. Design and protocol: docs/DESIGN.md in the yandex-relay repo.
 
 from __future__ import annotations
 
+import json
 import logging
+from datetime import timedelta
 from typing import TYPE_CHECKING, Any
 
 from aiohttp import web
@@ -20,7 +22,11 @@ from homeassistant.const import CONF_HOST, CONF_PORT, EVENT_HOMEASSISTANT_STARTE
 from homeassistant.core import CoreState, Event, HomeAssistant, callback
 from homeassistant.exceptions import ConfigEntryAuthFailed, ConfigEntryNotReady
 from homeassistant.helpers.aiohttp_client import async_get_clientsession
-from homeassistant.helpers.event import async_call_later, async_track_state_change_event
+from homeassistant.helpers.event import (
+    async_call_later,
+    async_track_state_change_event,
+    async_track_time_interval,
+)
 
 from .api import RelayAuthError, RelayClient, RelayError
 from .const import (
@@ -32,7 +38,7 @@ from .const import (
     SOURCE_STATION,
     YANDEX_DOMAIN,
 )
-from .helpers import room_stop_pauses_station, station_calls_for_transport
+from .helpers import extract_directives, room_stop_pauses_station, station_calls_for_transport
 
 if TYPE_CHECKING:
     from .media_player import RelayRoomPlayer
@@ -42,6 +48,8 @@ _LOGGER = logging.getLogger(__name__)
 
 PLATFORMS = [Platform.MEDIA_PLAYER, Platform.SWITCH]
 SOURCE_CHECK_DELAY = 10  # s after HA start before stations are pointed at their rooms
+HOOK_CHECK_INTERVAL = timedelta(seconds=60)  # re-attach after AlexxIT reconnects/reloads
+EVENT_VINS = "c4_relay_vins"
 
 
 class RelayHub:
@@ -60,6 +68,8 @@ class RelayHub:
         self.players: dict[int, RelayRoomPlayer] = {}
         self.switches: dict[str, RelayEnabledSwitch] = {}
         self._yandex_reloaded = False
+        self._last_diag: dict[str, tuple] = {}
+        self._hook_failed: set[str] = set()
 
     # --- bindings ---------------------------------------------------------
     def station_for_room(self, room_id: int | None) -> str | None:
@@ -77,6 +87,65 @@ class RelayHub:
         await self.hass.services.async_call(
             "media_player", service, {"entity_id": station, **(data or {})}, blocking=False
         )
+
+    # --- Glagol messages (diagnostic, 0.2.1) -------------------------------
+    def _station_entity(self, station: str) -> Any:
+        try:
+            return self.hass.data["entity_components"]["media_player"].get_entity(station)
+        except (KeyError, AttributeError):
+            return None
+
+    @callback
+    def hook_stations(self) -> None:
+        """Watch every bound station's Glagol messages without changing them.
+
+        AlexxIT hands each local message to glagol.update_handler (its own
+        async_set_state). We wrap that callable and pass everything through
+        unchanged; the wrapper only looks at the message. Re-run periodically:
+        AlexxIT creates a new Glagol client when the station reconnects.
+        """
+        for station in self.bindings:
+            ent = self._station_entity(station)
+            glagol = getattr(ent, "glagol", None)
+            original = getattr(glagol, "update_handler", None)
+            if glagol is None or original is None:
+                if station not in self._hook_failed:
+                    self._hook_failed.add(station)
+                    _LOGGER.warning("%s: no local Glagol connection to watch (yet)", station)
+                continue
+            if getattr(original, "_c4_relay_hook", False):
+                continue
+            hub = self
+
+            def wrapper(data, _original=original, _station=station):
+                try:
+                    hub.on_glagol_message(_station, data)
+                except Exception:  # never break AlexxIT because of us
+                    _LOGGER.exception("c4_relay Glagol hook failed")
+                return _original(data)
+
+            wrapper._c4_relay_hook = True
+            glagol.update_handler = wrapper
+            self._hook_failed.discard(station)
+            _LOGGER.warning("c4_relay diagnostic: watching Glagol messages of %s", station)
+
+    @callback
+    def on_glagol_message(self, station: str, data: Any) -> None:
+        if not isinstance(data, dict):
+            return
+        state = data.get("state") or {}
+        key = (state.get("aliceState"), state.get("volume"), state.get("playing"))
+        if self._last_diag.get(station) != key:
+            self._last_diag[station] = key
+            _LOGGER.warning("c4_relay diagnostic: %s aliceState=%s volume=%s playing=%s",
+                            station, *key)
+        vins = data.get("vinsResponse")
+        if vins:
+            directives = extract_directives(vins)
+            _LOGGER.warning("c4_relay diagnostic: %s directives=%s vinsResponse=%s", station,
+                            json.dumps(directives, ensure_ascii=False),
+                            json.dumps(vins, ensure_ascii=False)[:3000])
+            self.hass.bus.async_fire(EVENT_VINS, {"entity_id": station, "directives": directives})
 
     async def ensure_sources(self) -> None:
         """Point every enabled, bound station at its room player.
@@ -206,6 +275,13 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     @callback
     def _check_later(_: Any = None) -> None:
         entry.async_on_unload(async_call_later(hass, SOURCE_CHECK_DELAY, _check_sources))
+
+    @callback
+    def _hook(_now: Any = None) -> None:
+        hub.hook_stations()
+
+    entry.async_on_unload(async_track_time_interval(hass, _hook, HOOK_CHECK_INTERVAL))
+    _hook()
 
     if hass.state is CoreState.running:
         _check_later()

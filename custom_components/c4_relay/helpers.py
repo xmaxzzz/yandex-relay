@@ -98,6 +98,30 @@ def station_calls_for_transport(action: str, resume: str | None) -> list[tuple[s
     return []
 
 
+def extract_directives(vins: object) -> list[dict]:
+    """All VINS directives in a Glagol vinsResponse, wherever they are nested.
+
+    The layout differs between devices (Yandex Module wraps it in "payload"),
+    so every list called "directives" is collected: [{"name": .., "payload": ..}].
+    """
+    found: list[dict] = []
+
+    def walk(node: object) -> None:
+        if isinstance(node, dict):
+            for key, value in node.items():
+                if key == "directives" and isinstance(value, list):
+                    for d in value:
+                        if isinstance(d, dict) and d.get("name"):
+                            found.append({"name": d.get("name"), "payload": d.get("payload")})
+                walk(value)
+        elif isinstance(node, list):
+            for item in node:
+                walk(item)
+
+    walk(vins)
+    return found
+
+
 def room_stop_pauses_station(event: str, state: str | None) -> bool:
     """Whether a driver event means the room stopped playing for the user.
 

@@ -71,3 +71,13 @@ def test_room_stop_pauses_station():
     assert not f("state", "ended")          # natural end: station moves on
     assert not f("state", "playing")
     assert not f("transport", None)
+
+
+def test_extract_directives_anywhere():
+    vins = {"response": {"directives": [{"name": "sound_louder", "payload": {}}],
+                         "card": {"text": "Громче"}},
+            "payload": {"response": {"directives": [{"name": "sound_set_level", "payload": {"new_level": 5}}]}}}
+    names = [d["name"] for d in helpers.extract_directives(vins)]
+    assert sorted(names) == ["sound_louder", "sound_set_level"]
+    assert helpers.extract_directives({"response": {"card": {}}}) == []
+    assert helpers.extract_directives(None) == []
