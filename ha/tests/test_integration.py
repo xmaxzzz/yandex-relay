@@ -634,3 +634,62 @@ async def test_unavailable_station_raises_no_alexxit_issue(hass, aioclient_mock,
     await entry.runtime_data.heartbeat(now=500)
     assert issue(hass, entry, f"volume_fallback:{station}") is None
     assert "Офис: station unavailable" in calls_to(aioclient_mock, "/heartbeat")[-1][2]["summary"]
+
+
+# --- stray play_media while the station is paused (0.5.1) -----------------------
+
+def glagol_state(playing: bool, track: str = "1675194") -> dict:
+    return {"state": {"aliceState": "IDLE", "volume": 0.0, "playing": playing,
+                      "playerState": {"id": track}}}
+
+
+async def play_media(hass, entry, url="https://s1.storage.yandex.net/get-mp3/x/y/z.mp3"):
+    await hass.services.async_call("media_player", "play_media", {
+        "entity_id": player_id(hass, entry), "media_content_type": "music",
+        "media_content_id": proxy_url(url)}, blocking=True)
+
+
+async def test_resync_while_paused_does_not_start_room(hass, aioclient_mock, relay) -> None:
+    entry, station, calls = relay
+    glagol, _, patcher = hook_fake_station(entry.runtime_data)
+    try:
+        glagol.update_handler(glagol_state(playing=False))
+        await play_media(hass, entry)                     # AlexxIT: source selected again
+        assert calls_to(aioclient_mock, "/play") == []
+        glagol.update_handler(glagol_state(playing=True))
+        await hass.services.async_call("media_player", "media_play",
+                                       {"entity_id": player_id(hass, entry)}, blocking=True)
+    finally:
+        patcher.stop()
+    assert len(calls_to(aioclient_mock, "/play")) == 1       # the held track, not /resume
+    assert calls_to(aioclient_mock, "/resume") == []
+    assert calls[-1] == (station, "media_seek", {"seek_position": 0})
+
+
+async def test_track_change_while_playing_goes_through(hass, aioclient_mock, relay) -> None:
+    entry, _, _ = relay
+    glagol, _, patcher = hook_fake_station(entry.runtime_data)
+    try:
+        glagol.update_handler(glagol_state(playing=True))
+        await play_media(hass, entry)
+    finally:
+        patcher.stop()
+    assert len(calls_to(aioclient_mock, "/play")) == 1
+
+
+async def test_paused_station_by_ha_state_without_hook(hass, aioclient_mock, relay) -> None:
+    entry, station, _ = relay
+    set_station(hass, station, state="paused")
+    await play_media(hass, entry)
+    assert calls_to(aioclient_mock, "/play") == []
+
+
+async def test_room_with_two_stations_follows_the_playing_one(hass, aioclient_mock, relay) -> None:
+    entry, station, _ = relay
+    hub = entry.runtime_data
+    other = "media_player.yandex_station_bedroom"
+    hub.bindings = {other: 21, station: 21}
+    name = hub.players[21].name
+    hass.states.async_set(other, "paused", {"source": name, "source_list": ["Станция", name]})
+    set_station(hass, station, state="playing", source=name, source_list=["Станция", name])
+    assert hub.station_for_room(21) == station

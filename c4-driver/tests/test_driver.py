@@ -117,7 +117,7 @@ class Boot(unittest.TestCase):
         self.assertEqual(len(code), 8)
         self.assertEqual(d.calls("CreateServer")[0]["port"], 18765)
         self.assertIn("2: Гостиная & кухня, Спальня", d.prop("Rooms Found"))
-        self.assertEqual(d.prop("Driver Version"), "0.5.0")
+        self.assertEqual(d.prop("Driver Version"), "0.5.1")
         self.assertEqual(d.g.PERSIST["pairing_code"], code)
         self.assertEqual(d.calls("RegisterVariableListener")[0]["var"], 1009)
 
@@ -143,7 +143,7 @@ class Http(unittest.TestCase):
     def test_info(self):
         code, body = self.d.http("GET", "/info")
         self.assertEqual(code, 200)
-        self.assertEqual(body["version"], "0.5.0")
+        self.assertEqual(body["version"], "0.5.1")
         self.assertFalse(body["paired"])
 
     def test_split_packets(self):
@@ -159,7 +159,7 @@ class Http(unittest.TestCase):
         self.assertEqual(code, 200)
         self.assertEqual(self.d.prop("Paired With"), "ha:8123")
         self.assertEqual(self.d.g.PERSIST["webhook"], "http://ha:8123/api/webhook/abc")
-        self.assertEqual(self.d.webhooks("hello")[0]["driver_version"], "0.5.0")
+        self.assertEqual(self.d.webhooks("hello")[0]["driver_version"], "0.5.1")
         self.assertEqual(self.d.calls("urlPost")[0]["url"], "http://ha:8123/api/webhook/abc")
 
     def test_pair_rejects_bad_url(self):
@@ -252,6 +252,36 @@ class Playback(unittest.TestCase):
         self.assertEqual(self.d.room(12)["state"], "ended")
         self.assertEqual(len(self.d.proxy_cmds("SELECT_INTERNET_RADIO")), 1)
         self.assertEqual(self.d.webhooks("state")[-1]["state"], "ended")
+
+    def test_stop_at_track_length_is_natural_end(self):
+        # Site 2026-09-29: digital audio reports STOP (not END) when the mp3 ends.
+        self.start()
+        self.d.proxy("QUEUE_STATE_CHANGED", QUEUE_ID=501, STATE="STOP", QUEUE_INFO="t1", PREV_STATE_TIME=175)
+        self.assertEqual(self.d.room(12)["state"], "ended")
+        self.assertEqual(self.d.webhooks("state")[-1]["state"], "ended")
+
+    def test_short_insert_ends_without_fallback(self):
+        body = play_body(key="shot")
+        body["duration_ms"] = 5000
+        self.d.http("POST", "/play", body)
+        self.d.proxy("INTERNET_RADIO_SELECTED", QUEUE_ID=501, ROOM_ID=12, QUEUE_INFO="shot")
+        self.d.set_time(1005)
+        self.d.proxy("QUEUE_STATE_CHANGED", QUEUE_ID=501, STATE="STOP", QUEUE_INFO="shot", PREV_STATE_TIME=5)
+        self.assertEqual(len(self.d.proxy_cmds("SELECT_INTERNET_RADIO")), 1)
+        self.assertEqual(self.d.room(12)["state"], "ended")
+
+    def test_early_stop_still_stopped(self):
+        self.start()
+        self.d.set_time(1100)
+        self.d.proxy("QUEUE_STATE_CHANGED", QUEUE_ID=501, STATE="STOP", QUEUE_INFO="t1", PREV_STATE_TIME=100)
+        self.assertEqual(self.d.room(12)["state"], "stopped")
+
+    def test_webhook_id_masked_in_log(self):
+        out = []
+        self.d.g.print = lambda *a: out.append(" ".join(str(x) for x in a))
+        self.d.http("POST", "/heartbeat", {"webhook_url": "http://ha:8123/api/webhook/abc-SECRET_1"})
+        self.assertTrue(any("/api/webhook/***" in line for line in out))
+        self.assertFalse(any("SECRET" in line for line in out))
 
     def test_new_track_ignores_old_track_events(self):
         self.start("t1")
@@ -932,7 +962,7 @@ class HaLink(unittest.TestCase):
         self.d.http("POST", "/pair", {"webhook_url": self.hook})
         body = self.d.http("POST", "/heartbeat", {"webhook_url": self.hook,
                                                   "summary": "c4_relay 0.5.0, AlexxIT 3.19; Офис ok"})[1]
-        self.assertEqual(body, {"ok": True, "version": "0.5.0", "paired": True})
+        self.assertEqual(body, {"ok": True, "version": "0.5.1", "paired": True})
         self.assertEqual(self.d.prop("Home Assistant"), "online · c4_relay 0.5.0, AlexxIT 3.19; Офис ok")
         self.assertEqual(self.d.g.VARS["HA_ONLINE"], "1")
         self.d.set_time(1170)

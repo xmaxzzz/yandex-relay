@@ -1,5 +1,5 @@
 -- ============================================================
--- Yandex Relay  Control4 Driver  v0.5.0
+-- Yandex Relay  Control4 Driver  v0.5.1
 --
 -- Plays the music a Yandex Station has started into the Control4 room the
 -- station is bound to. The station stays the queue master (via AlexxIT
@@ -9,6 +9,10 @@
 -- Design, protocol and stages: docs/DESIGN.md in the yandex-relay repo.
 --
 -- Changelog:
+--   v0.5.1 - A STOP/END within 10 s of the track's length is a natural end
+--            ("ended": HA leaves the station alone, no fallback retry),
+--            so short Моя волна inserts no longer stop the station. Webhook
+--            IDs are masked in the request log.
 --   v0.5.0 - Home Assistant link: /heartbeat (every 60 s from HA, with a
 --            health summary shown in "Home Assistant"); 3 min of silence
 --            fires "Home Assistant: связь потеряна", the next request
@@ -77,13 +81,14 @@
 --            selection events pushed to the Home Assistant webhook.
 -- ============================================================
 
-local DRIVER_VERSION  = "0.5.0"
+local DRIVER_VERSION  = "0.5.1"
 local PROXY           = 5001
 local DIGITAL_AUDIO   = 100002   -- Digital Audio device (same id TuneIn watches)
 local DA_ROOM_MAP_VAR = 1009     -- its room<->queue map variable (XML)
 local DEFAULT_PORT    = 18765
 local LOCATION_ROOM_TYPE = "8"   -- <type> of a room item in GetProjectItems XML
 local FALLBACK_WINDOW = 8        -- s: STOP/END this soon after start = stream failed
+local END_MARGIN      = 10       -- s: STOP/END this close to the track length = natural end
 local META_TICKS      = 8        -- s: re-assert metadata after start (ICY overwrite)
 local MAX_REQUEST     = 65536    -- bytes: max HTTP request we accept
 local CLOSE_DELAY_MS  = 1500     -- give the client time to read before we close
@@ -1595,7 +1600,7 @@ local function HandleRequest(h, req)
         b = JSON:decode(req.body)
         if type(b) ~= "table" then return SendResponse(h, 400, { error = "body must be JSON object" }) end
     end
-    Log(req.method .. " " .. req.path .. " " .. req.body:sub(1, 300))
+    Log(req.method .. " " .. req.path .. " " .. (req.body:sub(1, 300):gsub("/api/webhook/[%w_%-]+", "/api/webhook/***")))
     local ok, code, resp = pcall(fn, req, b)
     if not ok then
         LogE("handler " .. req.path .. ": " .. tostring(code))
@@ -1796,6 +1801,14 @@ function RFP.INTERNET_RADIO_SELECTED(tP)
     WebhookState(r)
 end
 
+-- Played (almost) to the length the station reported for the track.
+local function NearTrackEnd(r, tP)
+    local dur = (tonumber(r.track and r.track.duration_ms) or 0) / 1000
+    if dur <= 0 then return false end
+    local played = tonumber(tP.PREV_STATE_TIME) or (os.time() - (r.started_at or os.time()))
+    return played >= dur - END_MARGIN
+end
+
 function RFP.QUEUE_STATE_CHANGED(tP)
     local qid = tonumber(tP.QUEUE_ID or tP.QUEUEID)
     local rid = qid and gQueueRoom[qid]
@@ -1810,6 +1823,11 @@ function RFP.QUEUE_STATE_CHANGED(tP)
     elseif r.intent == "switch" and os.time() - (r.started_at or 0) <= FALLBACK_WINDOW then
         Log("state " .. st .. " of the replaced stream, ignored")
         return
+    elseif (st == "STOP" or st == "END") and r.intent == nil and NearTrackEnd(r, tP) then
+        -- The track played out. Digital audio reports STOP for that too; the
+        -- station moves on by itself, so this must not pause it (short Моя
+        -- волна inserts, site 2026-09-29).
+        r.state = "ended"
     elseif st == "PAUSE" or st == "STOP" or st == "END" then
         if r.intent == "switch" then r.intent = nil end   -- switch window expired
         if r.intent == nil and TryFallback(r) then return end

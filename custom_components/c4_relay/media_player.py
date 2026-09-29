@@ -79,6 +79,7 @@ class RelayRoomPlayer(MediaPlayerEntity):
         self._attr_state = MediaPlayerState.IDLE
         self._attr_volume_level = None
         self._station_volume_seen = False
+        self._held_play: dict[str, Any] | None = None   # play_media ignored while paused
 
     async def async_added_to_hass(self) -> None:
         try:
@@ -149,6 +150,16 @@ class RelayRoomPlayer(MediaPlayerEntity):
         }
         if not payload.get("key"):
             payload["key"] = media_id.rsplit("/", 1)[-1][:40]
+        # AlexxIT re-sends the current track whenever the station's source is
+        # selected again (its reload, our self-healing), even while the station
+        # is paused: that switched the room on by itself (site 2026-09-29). Keep
+        # it for a later "play" instead.
+        station = self._hub.station_for_room(self.room_id)
+        if station and self._hub.station_playing(station) is False:
+            _LOGGER.info("Room %s: %s is paused, its track is not started in Control4", self.room_id, station)
+            self._held_play = payload
+            return
+        self._held_play = None
         self._attr_media_image_url = meta.get("image") or None
         self._attr_media_duration = (meta.get("duration_ms") or 0) / 1000 or None
         await self._call(self._hub.client.play(payload))
@@ -156,8 +167,14 @@ class RelayRoomPlayer(MediaPlayerEntity):
     async def async_media_play(self) -> None:
         # The station resumed. After a pause the room was switched off, so the
         # driver restarts the track; seek the station back to 0 to match.
-        resp = await self._call(self._hub.client.resume(self.room_id))
         station = self._hub.station_for_room(self.room_id)
+        if self._held_play is not None:           # the track AlexxIT sent while paused
+            payload, self._held_play = self._held_play, None
+            await self._call(self._hub.client.play(payload))
+            if station:
+                await self._hub.station_call(station, "media_seek", {"seek_position": 0})
+            return
+        resp = await self._call(self._hub.client.resume(self.room_id))
         if resp.get("resume") == "restart" and station:
             await self._hub.station_call(station, "media_seek", {"seek_position": 0})
 

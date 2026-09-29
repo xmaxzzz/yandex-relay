@@ -90,6 +90,7 @@ class RelayHub:
         self._last_diag: dict[str, tuple] = {}
         self._hook_failed: set[str] = set()
         self._station_volume: dict[str, float] = {}   # last volume seen in Glagol state
+        self._playing: dict[str, bool] = {}           # last "playing" seen in Glagol state
         # HA's copy of the driver's per-room volume settings (restored on re-add).
         self.store: Store = Store(hass, 1, f"{DOMAIN}.{entry.entry_id}")
         self.volume_cfg: dict = {}
@@ -102,10 +103,20 @@ class RelayHub:
 
     # --- bindings ---------------------------------------------------------
     def station_for_room(self, room_id: int | None) -> str | None:
-        for station, room in self.bindings.items():
-            if room == room_id:
-                return station
-        return None
+        """The room's station; with several, the one playing into the room now."""
+        stations = [s for s, room in self.bindings.items() if room == room_id]
+        if len(stations) > 1:
+            for station in stations:
+                if self.streaming(station) and self.station_playing(station):
+                    return station
+        return stations[0] if stations else None
+
+    def station_playing(self, station: str) -> bool | None:
+        """Whether the station itself plays (Glagol state first, HA state otherwise)."""
+        if station in self._playing:
+            return self._playing[station]
+        st = self.hass.states.get(station)
+        return None if st is None else st.state == "playing"
 
     def enabled(self, station: str) -> bool:
         sw = self.switches.get(station)
@@ -201,6 +212,8 @@ class RelayHub:
         if self._last_diag.get(station) != key:
             self._last_diag[station] = key
             _LOGGER.debug("%s aliceState=%s volume=%s playing=%s", station, *key)
+        if isinstance(state.get("playing"), bool):
+            self._playing[station] = state["playing"]
         before = self._station_volume.get(station)
         vins = data.get("vinsResponse")
         if vins:
