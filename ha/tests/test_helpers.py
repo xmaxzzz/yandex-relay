@@ -117,3 +117,16 @@ def test_alarm_from_event():
         "id": "b", "time": "07:30", "enabled": False, "date": "2026-09-29"}
     assert helpers.alarm_from_event(_Ev(start, rrule="FREQ=WEEKLY")) is None
     assert helpers.alarm_from_event(_Ev(date(2026, 9, 29))) is None      # all-day: not an alarm
+
+
+@pytest.mark.parametrize("final,unmute,expected", [
+    (0.1, 0.4, ("step", 1)),        # "громче" from the muted 0
+    (0.0, 0.4, ("step", -1)),       # "тише"
+    (0.5, 0.4, ("absolute", 0.5)),  # "громкость 5"
+    (0.4, 0.4, None),               # "сколько времени": the unmute level stays
+    (0.1, 0.1, None),               # ambiguous when unmute is 0.1 (kept at 0.4)
+    (None, 0.4, None),
+    (0.3, None, None),
+])
+def test_classify_dialog_volume(final, unmute, expected):
+    assert helpers.classify_dialog_volume(final, unmute) == expected

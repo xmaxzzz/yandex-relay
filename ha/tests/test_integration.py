@@ -741,3 +741,72 @@ async def test_user_pause_is_immediate(hass, aioclient_mock, relay, hass_admin_u
     finally:
         patcher.stop()
     assert len(calls_to(aioclient_mock, "/pause")) == 1
+
+
+# --- spoken volume commands without vinsResponse (0.6.2) -------------------------
+
+def hook_fake_station_with_level(hub, level):
+    from types import SimpleNamespace
+    glagol = SimpleNamespace(update_handler=lambda data: None)
+    fake = SimpleNamespace(glagol=glagol, _attr_volume_level=level)
+    patcher = patch.object(hub, "_station_entity", return_value=fake)
+    patcher.start()
+    hub.hook_stations()
+    return glagol, fake, patcher
+
+
+def alice(state, volume):
+    return {"state": {"aliceState": state, "volume": volume, "playing": True}}
+
+
+async def test_spoken_louder_quieter_and_level(hass, aioclient_mock, relay) -> None:
+    entry, station, _ = relay
+    set_station(hass, station, source="Control4 Офис", source_list=["Станция", "Control4 Офис"])
+    glagol, fake, patcher = hook_fake_station_with_level(entry.runtime_data, 0.1)
+    try:
+        await hass.async_block_till_done()
+        assert fake._attr_volume_level == 0.4                 # restore level kept away from 0.1
+        for seq in ([("LISTENING", 0.0), ("BUSY", 0.4), ("IDLE", 0.1)],     # "громче"
+                    [("LISTENING", 0.0), ("IDLE", 0.0)],                    # "тише"
+                    [("LISTENING", 0.4), ("BUSY", 0.4), ("IDLE", 0.5)],     # "громкость 5"
+                    [("LISTENING", 0.4), ("BUSY", 0.4), ("NONE", 0.4), ("IDLE", 0.4)]):  # a question
+            fake._attr_volume_level = 0.4
+            for st, vol in seq:
+                glagol.update_handler(alice(st, vol))
+            glagol.update_handler(alice("IDLE", 0.0))         # AlexxIT mutes again
+            await hass.async_block_till_done()
+    finally:
+        patcher.stop()
+    assert [c[2] for c in calls_to(aioclient_mock, "/volume_step")] == [
+        {"room_id": 21, "steps": 1}, {"room_id": 21, "steps": -1}]
+    assert [c[2] for c in calls_to(aioclient_mock, "/volume_level")] == [{"room_id": 21, "level": 0.5}]
+
+
+async def test_text_command_with_directive_not_counted_twice(hass, aioclient_mock, relay) -> None:
+    entry, station, _ = relay
+    set_station(hass, station, source="Control4 Офис", source_list=["Станция", "Control4 Офис"])
+    glagol, fake, patcher = hook_fake_station_with_level(entry.runtime_data, 0.4)
+    try:
+        glagol.update_handler(alice("BUSY", 0.4))
+        glagol.update_handler({"state": {"aliceState": "BUSY", "volume": 0.4, "playing": True},
+                               "vinsResponse": {"response": {"directives": [{"name": "sound_louder"}]}}})
+        glagol.update_handler(alice("IDLE", 0.5))
+        await hass.async_block_till_done()
+    finally:
+        patcher.stop()
+    assert [c[2] for c in calls_to(aioclient_mock, "/volume_step")] == [{"room_id": 21, "steps": 1}]
+    assert calls_to(aioclient_mock, "/volume_level") == []
+
+
+async def test_spoken_command_ignored_when_not_streaming(hass, aioclient_mock, relay) -> None:
+    entry, station, _ = relay
+    set_station(hass, station, source="Станция", source_list=["Станция", "Control4 Офис"])
+    glagol, fake, patcher = hook_fake_station_with_level(entry.runtime_data, 0.6)
+    try:
+        for st, vol in [("LISTENING", 0.6), ("IDLE", 0.7)]:
+            glagol.update_handler(alice(st, vol))
+        await hass.async_block_till_done()
+    finally:
+        patcher.stop()
+    assert calls_to(aioclient_mock, "/volume_step") == [] and calls_to(aioclient_mock, "/volume_level") == []
+    assert fake._attr_volume_level == 0.6                     # not streaming: AlexxIT's level untouched

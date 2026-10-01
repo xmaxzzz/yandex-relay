@@ -194,6 +194,29 @@ def alarm_from_event(event: Any) -> dict | None:
     return alarm
 
 
+def classify_dialog_volume(final: float | None, unmute: float | None) -> tuple[str, float] | None:
+    """A spoken volume command, read from the station volume when Alice is done.
+
+    Since 2026-10 spoken "громче/тише/громкость N" bring no vinsResponse (site
+    2026-10-01; text commands sent from HA still do). The station still runs
+    them, computed from its muted 0: "громче" leaves 0.1, "тише" 0.0,
+    "громкость N" N/10. Any other request leaves the level AlexxIT unmuted it
+    to for the dialog (`unmute`). So: the first IDLE volume differs from
+    `unmute` -> a volume command; 1 -> step up, 0 -> step down, else absolute.
+    `unmute` must not be 0.0/0.1 (c4_relay keeps it at UNMUTE_LEVEL).
+    """
+    if not isinstance(final, (int, float)) or not isinstance(unmute, (int, float)):
+        return None
+    if abs(final - unmute) < 0.05:
+        return None
+    level = int(round(final * 10))
+    if level == 1:
+        return ("step", 1)
+    if level == 0:
+        return ("step", -1)
+    return ("absolute", max(0.0, min(1.0, level / 10)))
+
+
 def room_stop_pauses_station(event: str, state: str | None) -> bool:
     """Whether a driver event means the room stopped playing for the user.
 

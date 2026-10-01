@@ -48,6 +48,7 @@ from .const import (
 )
 from .helpers import (
     alarm_from_event,
+    classify_dialog_volume,
     classify_volume_directives,
     extract_directives,
     room_stop_pauses_station,
@@ -65,6 +66,10 @@ SOURCE_CHECK_DELAY = 10  # s after HA start before stations are pointed at their
 HOOK_CHECK_INTERVAL = timedelta(seconds=60)  # re-attach after AlexxIT reconnects/reloads
 EVENT_VINS = "c4_relay_vins"
 EVENT_ALARM = "c4_relay_alarm"
+# Level AlexxIT unmutes a streaming station to while Alice talks. Kept away
+# from 0.0/0.1 (what "тише"/"громче" leave behind) so spoken commands can be
+# told from other requests; also Alice's answers stay audible.
+UNMUTE_LEVEL = 0.4
 ALARM_SYNC_INTERVAL = timedelta(seconds=30)  # AlexxIT polls the alarms about once a minute
 HEARTBEAT_INTERVAL = timedelta(seconds=60)   # the driver calls HA offline after 3 min of silence
 HEALTH_ISSUE_AFTER = 180       # s a station problem lasts before a Repairs issue
@@ -93,6 +98,7 @@ class RelayHub:
         self._station_volume: dict[str, float] = {}   # last volume seen in Glagol state
         self._playing: dict[str, bool] = {}           # last "playing" seen in Glagol state
         self._dump_until: dict[str, float] = {}       # debug: full messages around a dialog
+        self._dialog: dict[str, dict] = {}            # station -> {"unmute", "handled"} while Alice talks
         # HA's copy of the driver's per-room volume settings (restored on re-add).
         self.store: Store = Store(hass, 1, f"{DOMAIN}.{entry.entry_id}")
         self.volume_cfg: dict = {}
@@ -169,6 +175,7 @@ class RelayHub:
             wrapper._c4_relay_hook = True
             glagol.update_handler = wrapper
             self._hook_failed.discard(station)
+            self.keep_unmute_level(station)
             _LOGGER.info("Watching Glagol messages of %s for volume commands", station)
 
     def hooked(self, station: str | None) -> bool:
@@ -229,6 +236,10 @@ class RelayHub:
                 _LOGGER.debug("%s dialog msg state=%s extra=%s", station,
                               json.dumps(brief, ensure_ascii=False)[:1200],
                               json.dumps(extra, ensure_ascii=False)[:800])
+        alice = state.get("aliceState")
+        dialog = self._dialog.get(station)
+        if alice is not None and alice != "IDLE" and dialog is None:
+            dialog = self._dialog[station] = {"unmute": self.unmute_level(station), "handled": False}
         before = self._station_volume.get(station)
         vins = data.get("vinsResponse")
         if vins:
@@ -239,8 +250,39 @@ class RelayHub:
             if command and self.streaming(station):
                 _LOGGER.debug("%s: volume command %s (station was %s)", station, command, before)
                 self.hass.async_create_task(self.apply_volume_command(station, *command))
+                if dialog is not None:
+                    dialog["handled"] = True
+        if alice == "IDLE" and dialog is not None:
+            # Alice is done: a spoken command shows only in the station volume.
+            self._dialog.pop(station, None)
+            if not dialog["handled"] and self.streaming(station):
+                command = classify_dialog_volume(state.get("volume"), dialog["unmute"])
+                if command:
+                    _LOGGER.debug("%s: spoken volume command %s (volume %s, unmute %s)", station,
+                                  command, state.get("volume"), dialog["unmute"])
+                    self.hass.async_create_task(self.apply_volume_command(station, *command))
+            # after AlexxIT has taken the new level from this same message
+            self.hass.loop.call_soon(self.keep_unmute_level, station)
         if isinstance(state.get("volume"), (int, float)):
             self._station_volume[station] = float(state["volume"])
+
+    def unmute_level(self, station: str) -> float | None:
+        """The level AlexxIT restores the muted station to (its volume_level)."""
+        level = getattr(self._station_entity(station), "_attr_volume_level", None)
+        return float(level) if isinstance(level, (int, float)) else None
+
+    @callback
+    def keep_unmute_level(self, station: str) -> None:
+        """Keep AlexxIT's restore level at UNMUTE_LEVEL while the station streams.
+
+        AlexxIT unmutes to its last non-zero volume, which after "громче" is
+        0.1: the next "громче" (also 0.1) could not be seen, and Alice answered
+        barely audibly.
+        """
+        ent = self._station_entity(station)
+        level = getattr(ent, "_attr_volume_level", None)
+        if ent is not None and self.streaming(station) and level != UNMUTE_LEVEL:
+            ent._attr_volume_level = UNMUTE_LEVEL
 
     # --- alarms (AlexxIT alarm calendar -> driver schedule) ------------------
     def _calendar_of(self, station: str) -> tuple[str | None, bool]:
