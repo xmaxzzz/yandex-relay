@@ -1,5 +1,5 @@
 -- ============================================================
--- Yandex Relay  Control4 Driver  v0.5.1
+-- Yandex Relay  Control4 Driver  v0.5.2
 --
 -- Plays the music a Yandex Station has started into the Control4 room the
 -- station is bound to. The station stays the queue master (via AlexxIT
@@ -9,6 +9,13 @@
 -- Design, protocol and stages: docs/DESIGN.md in the yandex-relay repo.
 --
 -- Changelog:
+--   v0.5.2 - Digital audio dropping the queue mid-track with no OFF or source
+--            change (site 2026-10-01: QUEUE_DELETED at 63-149 s, nothing else)
+--            is a lost stream, not "another source": the track is restarted
+--            (the other URL first, up to 2 times per track) and HA seeks the
+--            station back to 0, instead of pausing the station. A queue that
+--            goes because the room picked another source (DEVICE_DESELECTED or
+--            the room's CURRENT_SELECTED_DEVICE) still pauses the station.
 --   v0.5.1 - A STOP/END within 10 s of the track's length is a natural end
 --            ("ended": HA leaves the station alone, no fallback retry),
 --            so short Моя волна inserts no longer stop the station. Webhook
@@ -81,7 +88,7 @@
 --            selection events pushed to the Home Assistant webhook.
 -- ============================================================
 
-local DRIVER_VERSION  = "0.5.1"
+local DRIVER_VERSION  = "0.5.2"
 local PROXY           = 5001
 local DIGITAL_AUDIO   = 100002   -- Digital Audio device (same id TuneIn watches)
 local DA_ROOM_MAP_VAR = 1009     -- its room<->queue map variable (XML)
@@ -89,6 +96,8 @@ local DEFAULT_PORT    = 18765
 local LOCATION_ROOM_TYPE = "8"   -- <type> of a room item in GetProjectItems XML
 local FALLBACK_WINDOW = 8        -- s: STOP/END this soon after start = stream failed
 local END_MARGIN      = 10       -- s: STOP/END this close to the track length = natural end
+local LOST_RETRIES    = 2        -- restarts per track after digital audio dropped the queue
+local LOST_CHECK_MS   = 1500     -- let the room settle before deciding why the queue went
 local META_TICKS      = 8        -- s: re-assert metadata after start (ICY overwrite)
 local MAX_REQUEST     = 65536    -- bytes: max HTTP request we accept
 local CLOSE_DELAY_MS  = 1500     -- give the client time to read before we close
@@ -388,6 +397,7 @@ end
 local gRooms       = {}
 local gQueueRoom   = {}   -- [queueId] = roomId that started the queue (session source)
 local gRoomMap     = {}   -- [queueId] = {roomId, ...} from Digital Audio 1009
+local gQueueDevice = {}   -- [queueId] = device_id digital audio reports for it
 local gProjectRooms = {}  -- { {id=, name=}, ... }
 local gPairing     = { code = nil, webhook = nil }
 local gClients     = {}   -- [handle] = { buf = "", ip = "" }
@@ -593,6 +603,7 @@ local function PlayInRoom(r, b)
         key = b.key or tostring(os.time()),
     }
     r.fallback_used = (url == nil)
+    r.lost_retries = 0
     -- Replacing a live stream: its STOP/END is expected, not a failure.
     r.intent = (r.state == "playing" or r.state == "starting") and "switch" or nil
     r.state = "starting"
@@ -712,6 +723,11 @@ end
 local function OnRoomMap(xml)
     Log("room map " .. tostring(xml):sub(1, 400))
     gRoomMap = ParseRoomMap(xml)
+    for q in tostring(xml or ""):gmatch("<queue>(.-)</queue>") do
+        local qid = tonumber(q:match("^<id>(%d+)</id>") or q:match("<id>(%d+)</id>"))
+        local dev = tonumber(q:match("<device_id>(%d+)</device_id>"))
+        if qid and dev then gQueueDevice[qid] = dev end
+    end
     -- A playing room that left its queue switched to another source.
     for _, r in pairs(gRooms) do
         if r.state == "playing" and r.queueId and gRoomMap[r.queueId]
@@ -1767,6 +1783,51 @@ function RFP.QUEUE_INFO_CHANGED(tP) end
 
 function RFP.DEVICE_DESELECTED(tP)
     Log("DEVICE_DESELECTED room=" .. tostring(tP.ROOM_ID or tP.idRoom))
+    local r = RoomFromParams(tP)
+    if r then r.deselected_at = os.time() end
+end
+
+-- The room's CURRENT_SELECTED_DEVICE variable, nil if it has none.
+local function RoomSelectedDevice(roomId)
+    local ok, vars = pcall(function() return C4:GetDeviceVariables(roomId) end)
+    if not ok or type(vars) ~= "table" then return nil end
+    for _, var in pairs(vars) do
+        if type(var) == "table" and (var.name or var.NAME) == "CURRENT_SELECTED_DEVICE" then
+            return tonumber(var.value or var.VALUE)
+        end
+    end
+    return nil
+end
+
+-- Digital audio deleted the queue of a playing room by itself. A source
+-- change (DEVICE_DESELECTED, or the room now shows another device) stops the
+-- station as before; otherwise the stream was lost: start the track again,
+-- the other URL first, and have HA seek the station to 0 to stay in step.
+local function OnQueueLost(r, qid, deselected)
+    if r.state ~= "stopped" or r.queueId then return end   -- a new /play came meanwhile
+    local sel, mine = RoomSelectedDevice(r.id), gQueueDevice[qid]
+    gQueueDevice[qid] = nil
+    local other = deselected or (sel ~= nil and sel ~= 0 and sel ~= mine and sel ~= DIGITAL_AUDIO)
+    Log("room " .. r.id .. ": queue " .. tostring(qid) .. " gone, selected device " .. tostring(sel)
+        .. ", ours " .. tostring(mine) .. ", deselected " .. tostring(deselected))
+    if other or not r.track or (r.lost_retries or 0) >= LOST_RETRIES then
+        LogI("room " .. r.id .. ": queue deleted while playing" .. (other and " (other source)" or ""))
+        Webhook({ event = "deselected", room_id = r.id })
+        return
+    end
+    r.lost_retries = (r.lost_retries or 0) + 1
+    local url
+    if r.fallback_used and r.track.url then
+        url, r.fallback_used = r.track.url, false
+    elseif r.track.fallback_url then
+        url, r.fallback_used = r.track.fallback_url, true
+    else
+        url = r.track.url
+    end
+    LogI("room " .. r.id .. ": stream lost mid-track, restarting (" .. r.lost_retries .. "/" .. LOST_RETRIES .. ")")
+    r.state, r.intent = "starting", nil
+    SelectStream(r, url)
+    Webhook({ event = "transport", room_id = r.id, action = "play", resume = "restart" })
 end
 
 -- QUEUE_INFO carries the track key we passed in SELECT_INTERNET_RADIO.
@@ -1848,9 +1909,9 @@ function RFP.QUEUE_DELETED(tP)
     if not r or r.queueId ~= qid then return end
     r.queueId = nil
     if r.state == "playing" and r.intent == nil then
-        LogI("room " .. r.id .. ": queue deleted while playing")
         r.state = "stopped"
-        Webhook({ event = "deselected", room_id = r.id })
+        local deselected = r.deselected_at ~= nil and os.time() - r.deselected_at <= 5
+        C4:SetTimer(LOST_CHECK_MS, function() OnQueueLost(r, qid, deselected) end)
     end
 end
 

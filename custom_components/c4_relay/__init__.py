@@ -21,12 +21,13 @@ from aiohttp import web
 
 from homeassistant.components import webhook
 from homeassistant.config_entries import ConfigEntry
-from homeassistant.const import CONF_HOST, CONF_PORT, EVENT_HOMEASSISTANT_STARTED, Platform
-from homeassistant.core import CoreState, Event, HomeAssistant, callback
+from homeassistant.const import CONF_HOST, CONF_PORT, Platform
+from homeassistant.core import Event, HomeAssistant, callback
 from homeassistant.exceptions import ConfigEntryAuthFailed, ConfigEntryNotReady
 from homeassistant.helpers import entity_registry as er
 from homeassistant.helpers import issue_registry as ir
 from homeassistant.helpers.aiohttp_client import async_get_clientsession
+from homeassistant.helpers.start import async_at_started
 from homeassistant.helpers.storage import Store
 from homeassistant.loader import async_get_integration
 from homeassistant.helpers.event import (
@@ -554,10 +555,10 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     entry.async_on_unload(async_track_time_interval(hass, _hook, HOOK_CHECK_INTERVAL))
     _hook()
 
-    if hass.state is CoreState.running:
-        _check_later()
-    else:
-        entry.async_on_unload(hass.bus.async_listen_once(EVENT_HOMEASSISTANT_STARTED, _check_later))
+    # async_at_started: its unsubscribe stays valid after the start event fired
+    # (a bare async_listen_once logged "Unable to remove unknown job listener"
+    # on unload, site 2026-10-01).
+    entry.async_on_unload(async_at_started(hass, _check_later))
 
     entry.async_on_unload(entry.add_update_listener(_options_updated))
     return True

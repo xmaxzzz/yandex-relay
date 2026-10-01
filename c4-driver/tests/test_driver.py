@@ -117,7 +117,7 @@ class Boot(unittest.TestCase):
         self.assertEqual(len(code), 8)
         self.assertEqual(d.calls("CreateServer")[0]["port"], 18765)
         self.assertIn("2: Гостиная & кухня, Спальня", d.prop("Rooms Found"))
-        self.assertEqual(d.prop("Driver Version"), "0.5.1")
+        self.assertEqual(d.prop("Driver Version"), "0.5.2")
         self.assertEqual(d.g.PERSIST["pairing_code"], code)
         self.assertEqual(d.calls("RegisterVariableListener")[0]["var"], 1009)
 
@@ -143,7 +143,7 @@ class Http(unittest.TestCase):
     def test_info(self):
         code, body = self.d.http("GET", "/info")
         self.assertEqual(code, 200)
-        self.assertEqual(body["version"], "0.5.1")
+        self.assertEqual(body["version"], "0.5.2")
         self.assertFalse(body["paired"])
 
     def test_split_packets(self):
@@ -159,7 +159,7 @@ class Http(unittest.TestCase):
         self.assertEqual(code, 200)
         self.assertEqual(self.d.prop("Paired With"), "ha:8123")
         self.assertEqual(self.d.g.PERSIST["webhook"], "http://ha:8123/api/webhook/abc")
-        self.assertEqual(self.d.webhooks("hello")[0]["driver_version"], "0.5.1")
+        self.assertEqual(self.d.webhooks("hello")[0]["driver_version"], "0.5.2")
         self.assertEqual(self.d.calls("urlPost")[0]["url"], "http://ha:8123/api/webhook/abc")
 
     def test_pair_rejects_bad_url(self):
@@ -464,11 +464,76 @@ class Playback(unittest.TestCase):
             "<audioQueueInfo><queue><id>501</id><rooms><id>13</id></rooms></queue></audioQueueInfo>")
         self.assertEqual(self.d.webhooks("deselected")[0]["room_id"], 12)
 
-    def test_queue_deleted_while_playing(self):
+    def room_selects(self, device):
+        self.d.lua.execute(f"""ROOM_VARS[12] = {{
+            [1000] = {{ name = "POWER_STATE", value = "1" }},
+            [1001] = {{ name = "CURRENT_SELECTED_DEVICE", value = "{device}" }},
+            [1011] = {{ name = "CURRENT_VOLUME", value = "40" }} }}""")
+
+    def queue_map(self, qid=501, device=2191):
+        self.d.g.OnWatchedVariableChanged(100002, 1009,
+            f"<audioQueueInfo><queue><id>{qid}</id><owner>12</owner><device_id>{device}</device_id>"
+            f"<state>Play</state><rooms><id>12</id></rooms></queue></audioQueueInfo>")
+
+    def test_queue_deleted_by_other_source(self):
         self.start()
+        self.queue_map()
+        self.room_selects(777)
         self.d.set_time(1100)
         self.d.proxy("QUEUE_DELETED", QUEUE_ID=501)
+        self.d.fire_timers()
         self.assertEqual(self.d.webhooks("deselected")[0]["room_id"], 12)
+        self.assertEqual(len(self.d.proxy_cmds("SELECT_INTERNET_RADIO")), 1)
+
+    def test_queue_deleted_after_device_deselected(self):
+        self.start()
+        self.queue_map()
+        self.room_selects(2191)
+        self.d.set_time(1100)
+        self.d.proxy("DEVICE_DESELECTED", ROOM_ID=12)
+        self.d.proxy("QUEUE_DELETED", QUEUE_ID=501)
+        self.d.fire_timers()
+        self.assertEqual(len(self.d.webhooks("deselected")), 1)
+
+    def test_lost_stream_restarts_track(self):
+        # Site 2026-10-01: QUEUE_DELETED at 134 s, no OFF, no source change.
+        self.start()
+        self.queue_map()
+        self.room_selects(2191)
+        self.d.set_time(1134)
+        self.d.proxy("QUEUE_DELETED", QUEUE_ID=501, LAST_STATE="PLAY", LAST_STATE_TIME=134)
+        self.assertEqual(self.d.webhooks("deselected"), [])
+        self.d.fire_timers()
+        self.assertEqual(self.d.webhooks("deselected"), [])
+        sel = self.d.proxy_cmds("SELECT_INTERNET_RADIO")
+        self.assertEqual(sel[-1]["params"]["STATION_URL"], "http://ha:8123/api/yandex_station/x.mp3")
+        ev = self.d.webhooks("transport")[-1]
+        self.assertEqual((ev["action"], ev["resume"]), ("play", "restart"))
+        self.assertEqual(self.d.room(12)["state"], "starting")
+
+    def test_lost_stream_gives_up_after_two_restarts(self):
+        self.start()
+        self.room_selects(0)                      # room shows nothing selected: still ours
+        for i, qid in enumerate((501, 502, 503)):
+            self.queue_map(qid)
+            if qid != 501:
+                self.d.proxy("INTERNET_RADIO_SELECTED", QUEUE_ID=qid, ROOM_ID=12, QUEUE_INFO="t1")
+            self.d.set_time(1100 + i * 100)
+            self.d.proxy("QUEUE_DELETED", QUEUE_ID=qid)
+            self.d.fire_timers()
+        self.assertEqual(len(self.d.proxy_cmds("SELECT_INTERNET_RADIO")), 3)
+        self.assertEqual(len(self.d.webhooks("deselected")), 1)
+
+    def test_new_play_during_check_wins(self):
+        self.start()
+        self.queue_map()
+        self.room_selects(2191)
+        self.d.set_time(1100)
+        self.d.proxy("QUEUE_DELETED", QUEUE_ID=501)
+        self.d.http("POST", "/play", play_body(key="t2", url="https://cdn/t2.mp3"))
+        self.d.fire_timers()
+        self.assertEqual(self.d.webhooks("deselected"), [])
+        self.assertEqual(self.d.proxy_cmds("SELECT_INTERNET_RADIO")[-1]["params"]["STATION_URL"], "https://cdn/t2.mp3")
 
     def test_progress_forwarded_to_queue_rooms(self):
         self.start()
@@ -962,7 +1027,7 @@ class HaLink(unittest.TestCase):
         self.d.http("POST", "/pair", {"webhook_url": self.hook})
         body = self.d.http("POST", "/heartbeat", {"webhook_url": self.hook,
                                                   "summary": "c4_relay 0.5.0, AlexxIT 3.19; Офис ok"})[1]
-        self.assertEqual(body, {"ok": True, "version": "0.5.1", "paired": True})
+        self.assertEqual(body, {"ok": True, "version": "0.5.2", "paired": True})
         self.assertEqual(self.d.prop("Home Assistant"), "online · c4_relay 0.5.0, AlexxIT 3.19; Офис ok")
         self.assertEqual(self.d.g.VARS["HA_ONLINE"], "1")
         self.d.set_time(1170)
