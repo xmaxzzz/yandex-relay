@@ -1,5 +1,5 @@
 -- ============================================================
--- Yandex Relay  Control4 Driver  v0.5.2
+-- Yandex Relay  Control4 Driver  v0.6.0
 --
 -- Plays the music a Yandex Station has started into the Control4 room the
 -- station is bound to. The station stays the queue master (via AlexxIT
@@ -9,6 +9,11 @@
 -- Design, protocol and stages: docs/DESIGN.md in the yandex-relay repo.
 --
 -- Changelog:
+--   v0.6.0 - Property "Stream": "Via HA" (default) plays the AlexxIT proxy
+--            URL first and keeps the direct CDN link as the alternative;
+--            "Direct" is the old order. Digital audio kept losing the direct
+--            CDN stream mid-track (site 2026-10-01: at 21, 39, 134 s), the
+--            proxy held. Early-failure switch works both ways (once a track).
 --   v0.5.2 - Digital audio dropping the queue mid-track with no OFF or source
 --            change (site 2026-10-01: QUEUE_DELETED at 63-149 s, nothing else)
 --            is a lost stream, not "another source": the track is restarted
@@ -88,7 +93,7 @@
 --            selection events pushed to the Home Assistant webhook.
 -- ============================================================
 
-local DRIVER_VERSION  = "0.5.2"
+local DRIVER_VERSION  = "0.6.0"
 local PROXY           = 5001
 local DIGITAL_AUDIO   = 100002   -- Digital Audio device (same id TuneIn watches)
 local DA_ROOM_MAP_VAR = 1009     -- its room<->queue map variable (XML)
@@ -602,13 +607,16 @@ local function PlayInRoom(r, b)
         image = b.image or "", duration_ms = tonumber(b.duration_ms) or 0,
         key = b.key or tostring(os.time()),
     }
-    r.fallback_used = (url == nil)
+    -- "Via HA" (default): the AlexxIT proxy first, the CDN link in reserve.
+    local viaHa = Properties["Stream"] ~= "Direct"
+    r.fallback_used = (fb ~= nil and (viaHa or url == nil))
+    r.switched = false
     r.lost_retries = 0
     -- Replacing a live stream: its STOP/END is expected, not a failure.
     r.intent = (r.state == "playing" or r.state == "starting") and "switch" or nil
     r.state = "starting"
     r.meta_ticks = 0
-    SelectStream(r, url or fb)
+    SelectStream(r, r.fallback_used and fb or url)
     if OnPlayStartedRef then OnPlayStartedRef(r.id) end
 end
 
@@ -633,13 +641,17 @@ end
 -- STOP/END right after a start means the stream did not open: retry once with
 -- the fallback URL (AlexxIT proxy) before giving up.
 local function TryFallback(r)
-    if r.fallback_used or not r.track or not r.track.fallback_url then return false end
+    if r.switched or not r.track then return false end
+    local other = r.fallback_used and r.track.url or (not r.fallback_used and r.track.fallback_url) or nil
+    if not other then return false end
     if os.time() - (r.started_at or 0) > FALLBACK_WINDOW then return false end
-    LogI("room " .. r.id .. ": direct stream failed, switching to fallback URL")
-    r.fallback_used = true
+    LogI("room " .. r.id .. ": " .. (r.fallback_used and "HA proxy" or "direct") .. " stream failed, switching to "
+        .. (r.fallback_used and "direct" or "fallback") .. " URL")
+    r.switched = true
+    r.fallback_used = not r.fallback_used
     r.state = "starting"
     r.intent = "switch"
-    SelectStream(r, r.track.fallback_url)
+    SelectStream(r, other)
     return true
 end
 
@@ -2014,6 +2026,7 @@ end
 
 function OnPropertyChanged(name)
     if name == "Bridge Port" then StartServer(); return end
+    if name == "Stream" then LogI("Stream: " .. tostring(Properties["Stream"]) .. " (from the next track)"); return end
     if name == "Pairing Code" then
         -- Copy it from here into HA, or paste the old code into a re-added
         -- driver: HA then pairs again by itself. Anything invalid is undone.

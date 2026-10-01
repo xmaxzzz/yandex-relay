@@ -2,7 +2,8 @@
 -- Every call lands in REC[<api>] so the Python tests can assert on it.
 
 REC = setmetatable({}, { __index = function(t, k) local v = {}; rawset(t, k, v); return v end })
-PROPS = { ["Debug Mode"] = "On", ["Bridge Port"] = "18765" }
+-- Most tests were written for the direct-first order; "Via HA" has its own.
+PROPS = { ["Debug Mode"] = "On", ["Bridge Port"] = "18765", ["Stream"] = "Direct" }
 Properties = PROPS
 PERSIST = {}
 FAKE_NOW = 1000

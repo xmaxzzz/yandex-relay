@@ -6,8 +6,8 @@
   <name>Yandex Relay</name>
   <model>Yandex Relay</model>
   <created>09/28/2026 00:00</created>
-  <modified>10/01/2026 17:29</modified>
-  <version>15</version>
+  <modified>10/01/2026 18:08</modified>
+  <version>16</version>
   <control>lua_gen</control>
   <controlmethod>IP</controlmethod>
   <driver>DriverWorks</driver>
@@ -49,6 +49,16 @@
         <type>STRING</type>
         <default></default>
         <readonly>true</readonly>
+      </property>
+      <property>
+        <name>Stream</name>
+        <type>LIST</type>
+        <items>
+          <item>Via HA</item>
+          <item>Direct</item>
+        </items>
+        <default>Via HA</default>
+        <readonly>false</readonly>
       </property>
       <property>
         <name>Rooms Found</name>
@@ -155,7 +165,7 @@
       <property>
         <name>Driver Version</name>
         <type>STRING</type>
-        <default>0.5.2</default>
+        <default>0.6.0</default>
         <readonly>true</readonly>
       </property>
     </properties>
