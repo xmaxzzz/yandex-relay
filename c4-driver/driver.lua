@@ -1,5 +1,5 @@
 -- ============================================================
--- Yandex Relay  Control4 Driver  v0.6.0
+-- Yandex Relay  Control4 Driver  v0.6.1
 --
 -- Plays the music a Yandex Station has started into the Control4 room the
 -- station is bound to. The station stays the queue master (via AlexxIT
@@ -9,6 +9,12 @@
 -- Design, protocol and stages: docs/DESIGN.md in the yandex-relay repo.
 --
 -- Changelog:
+--   v0.6.1 - A queue lost because another driver started its own queue in the
+--            room (queue map: a different device_id now holds the room) is a
+--            source change: the station is paused, no restart. Site 2026-10-01:
+--            the old Yandex Music driver kept its track timer running after
+--            losing the room and skipped to its next track into it, and the
+--            0.5.2 restart fought it back and forth.
 --   v0.6.0 - Property "Stream": "Via HA" (default) plays the AlexxIT proxy
 --            URL first and keeps the direct CDN link as the alternative;
 --            "Direct" is the old order. Digital audio kept losing the direct
@@ -93,7 +99,7 @@
 --            selection events pushed to the Home Assistant webhook.
 -- ============================================================
 
-local DRIVER_VERSION  = "0.6.0"
+local DRIVER_VERSION  = "0.6.1"
 local PROXY           = 5001
 local DIGITAL_AUDIO   = 100002   -- Digital Audio device (same id TuneIn watches)
 local DA_ROOM_MAP_VAR = 1009     -- its room<->queue map variable (XML)
@@ -1819,9 +1825,18 @@ local function OnQueueLost(r, qid, deselected)
     if r.state ~= "stopped" or r.queueId then return end   -- a new /play came meanwhile
     local sel, mine = RoomSelectedDevice(r.id), gQueueDevice[qid]
     gQueueDevice[qid] = nil
-    local other = deselected or (sel ~= nil and sel ~= 0 and sel ~= mine and sel ~= DIGITAL_AUDIO)
+    -- Another driver's queue holds the room now (both play through digital
+    -- audio, so the room's selected device alone does not tell them apart).
+    local taken = nil
+    for q, rooms in pairs(gRoomMap) do
+        if q ~= qid and Contains(rooms, r.id) and gQueueDevice[q] and gQueueDevice[q] ~= mine then
+            taken = gQueueDevice[q]
+        end
+    end
+    local other = deselected or taken ~= nil
+        or (sel ~= nil and sel ~= 0 and sel ~= mine and sel ~= DIGITAL_AUDIO)
     Log("room " .. r.id .. ": queue " .. tostring(qid) .. " gone, selected device " .. tostring(sel)
-        .. ", ours " .. tostring(mine) .. ", deselected " .. tostring(deselected))
+        .. ", ours " .. tostring(mine) .. ", taken by " .. tostring(taken) .. ", deselected " .. tostring(deselected))
     if other or not r.track or (r.lost_retries or 0) >= LOST_RETRIES then
         LogI("room " .. r.id .. ": queue deleted while playing" .. (other and " (other source)" or ""))
         Webhook({ event = "deselected", room_id = r.id })

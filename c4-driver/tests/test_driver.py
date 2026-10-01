@@ -117,7 +117,7 @@ class Boot(unittest.TestCase):
         self.assertEqual(len(code), 8)
         self.assertEqual(d.calls("CreateServer")[0]["port"], 18765)
         self.assertIn("2: Гостиная & кухня, Спальня", d.prop("Rooms Found"))
-        self.assertEqual(d.prop("Driver Version"), "0.6.0")
+        self.assertEqual(d.prop("Driver Version"), "0.6.1")
         self.assertEqual(d.g.PERSIST["pairing_code"], code)
         self.assertEqual(d.calls("RegisterVariableListener")[0]["var"], 1009)
 
@@ -143,7 +143,7 @@ class Http(unittest.TestCase):
     def test_info(self):
         code, body = self.d.http("GET", "/info")
         self.assertEqual(code, 200)
-        self.assertEqual(body["version"], "0.6.0")
+        self.assertEqual(body["version"], "0.6.1")
         self.assertFalse(body["paired"])
 
     def test_split_packets(self):
@@ -159,7 +159,7 @@ class Http(unittest.TestCase):
         self.assertEqual(code, 200)
         self.assertEqual(self.d.prop("Paired With"), "ha:8123")
         self.assertEqual(self.d.g.PERSIST["webhook"], "http://ha:8123/api/webhook/abc")
-        self.assertEqual(self.d.webhooks("hello")[0]["driver_version"], "0.6.0")
+        self.assertEqual(self.d.webhooks("hello")[0]["driver_version"], "0.6.1")
         self.assertEqual(self.d.calls("urlPost")[0]["url"], "http://ha:8123/api/webhook/abc")
 
     def test_pair_rejects_bad_url(self):
@@ -540,6 +540,21 @@ class Playback(unittest.TestCase):
         ev = self.d.webhooks("transport")[-1]
         self.assertEqual((ev["action"], ev["resume"]), ("play", "restart"))
         self.assertEqual(self.d.room(12)["state"], "starting")
+
+    def test_queue_taken_by_another_driver_is_no_lost_stream(self):
+        # Site 2026-10-01: the old Yandex Music driver skipped to its next track
+        # into the room; both use digital audio, the room shows the same device.
+        self.start()
+        self.queue_map()
+        self.room_selects(100002)
+        self.d.set_time(1100)
+        self.d.g.OnWatchedVariableChanged(100002, 1009,
+            "<audioQueueInfo><queue><id>777</id><owner>12</owner><device_id>1500</device_id>"
+            "<state>Play</state><rooms><id>12</id></rooms></queue></audioQueueInfo>")
+        self.d.proxy("QUEUE_DELETED", QUEUE_ID=501)
+        self.d.fire_timers()
+        self.assertEqual(len(self.d.webhooks("deselected")), 1)
+        self.assertEqual(len(self.d.proxy_cmds("SELECT_INTERNET_RADIO")), 1)
 
     def test_lost_stream_gives_up_after_two_restarts(self):
         self.start()
@@ -1057,7 +1072,7 @@ class HaLink(unittest.TestCase):
         self.d.http("POST", "/pair", {"webhook_url": self.hook})
         body = self.d.http("POST", "/heartbeat", {"webhook_url": self.hook,
                                                   "summary": "c4_relay 0.5.0, AlexxIT 3.19; Офис ok"})[1]
-        self.assertEqual(body, {"ok": True, "version": "0.6.0", "paired": True})
+        self.assertEqual(body, {"ok": True, "version": "0.6.1", "paired": True})
         self.assertEqual(self.d.prop("Home Assistant"), "online · c4_relay 0.5.0, AlexxIT 3.19; Офис ok")
         self.assertEqual(self.d.g.VARS["HA_ONLINE"], "1")
         self.d.set_time(1170)

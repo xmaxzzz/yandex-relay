@@ -6,8 +6,8 @@
   <name>Yandex Relay</name>
   <model>Yandex Relay</model>
   <created>09/28/2026 00:00</created>
-  <modified>10/01/2026 18:08</modified>
-  <version>16</version>
+  <modified>10/01/2026 18:37</modified>
+  <version>17</version>
   <control>lua_gen</control>
   <controlmethod>IP</controlmethod>
   <driver>DriverWorks</driver>
@@ -165,7 +165,7 @@
       <property>
         <name>Driver Version</name>
         <type>STRING</type>
-        <default>0.6.0</default>
+        <default>0.6.1</default>
         <readonly>true</readonly>
       </property>
     </properties>
