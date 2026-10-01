@@ -184,13 +184,15 @@ async def test_play_media_sends_direct_and_fallback(hass, aioclient_mock, relay)
     assert hass.states.get(player_id(hass, entry)).state == "playing"
 
 
-async def test_transport_commands_to_driver(hass, aioclient_mock, relay) -> None:
+async def test_transport_commands_to_driver(hass, aioclient_mock, relay, hass_admin_user) -> None:
+    from homeassistant.core import Context
     entry, station, calls = relay
     pid = player_id(hass, entry)
-    await hass.services.async_call("media_player", "media_pause", {"entity_id": pid}, blocking=True)
+    user = Context(user_id=hass_admin_user.id)            # a person: no track-change grace
+    await hass.services.async_call("media_player", "media_pause", {"entity_id": pid}, blocking=True, context=user)
     assert hass.states.get(pid).state == "paused"
     await hass.services.async_call("media_player", "media_play", {"entity_id": pid}, blocking=True)
-    await hass.services.async_call("media_player", "media_stop", {"entity_id": pid}, blocking=True)
+    await hass.services.async_call("media_player", "media_stop", {"entity_id": pid}, blocking=True, context=user)
     assert [len(calls_to(aioclient_mock, p)) for p in ("/pause", "/resume", "/stop")] == [1, 1, 1]
     await hass.services.async_call("media_player", "media_next_track", {"entity_id": pid}, blocking=True)
     assert calls[-1] == (station, "media_next_track", {})
@@ -693,3 +695,49 @@ async def test_room_with_two_stations_follows_the_playing_one(hass, aioclient_mo
     hass.states.async_set(other, "paused", {"source": name, "source_list": ["Станция", name]})
     set_station(hass, station, state="playing", source=name, source_list=["Станция", name])
     assert hub.station_for_room(21) == station
+
+
+# --- track change = pause + play from AlexxIT (0.5.3) ----------------------------
+
+async def test_track_change_keeps_room_on(hass, aioclient_mock, relay) -> None:
+    entry, _, _ = relay
+    glagol, _, patcher = hook_fake_station(entry.runtime_data)
+    try:
+        with patch("custom_components.c4_relay.media_player.PAUSE_SETTLE", 0.05):
+            glagol.update_handler(glagol_state(playing=True))
+            await hass.services.async_call("media_player", "media_pause",
+                                           {"entity_id": player_id(hass, entry)}, blocking=False)
+            await play_media(hass, entry)          # next track a moment later
+            await hass.async_block_till_done()
+    finally:
+        patcher.stop()
+    assert calls_to(aioclient_mock, "/pause") == []
+    assert len(calls_to(aioclient_mock, "/play")) == 1
+
+
+async def test_real_pause_still_switches_room_off(hass, aioclient_mock, relay) -> None:
+    entry, _, _ = relay
+    glagol, _, patcher = hook_fake_station(entry.runtime_data)
+    try:
+        with patch("custom_components.c4_relay.media_player.PAUSE_SETTLE", 0.05):
+            glagol.update_handler(glagol_state(playing=False))   # "Алиса, пауза"
+            await hass.services.async_call("media_player", "media_pause",
+                                           {"entity_id": player_id(hass, entry)}, blocking=True)
+    finally:
+        patcher.stop()
+    assert len(calls_to(aioclient_mock, "/pause")) == 1
+
+
+async def test_user_pause_is_immediate(hass, aioclient_mock, relay, hass_admin_user) -> None:
+    from homeassistant.core import Context
+    entry, _, _ = relay
+    glagol, _, patcher = hook_fake_station(entry.runtime_data)
+    try:
+        with patch("custom_components.c4_relay.media_player.PAUSE_SETTLE", 30):
+            glagol.update_handler(glagol_state(playing=True))
+            await hass.services.async_call("media_player", "media_pause",
+                                           {"entity_id": player_id(hass, entry)}, blocking=True,
+                                           context=Context(user_id=hass_admin_user.id))
+    finally:
+        patcher.stop()
+    assert len(calls_to(aioclient_mock, "/pause")) == 1

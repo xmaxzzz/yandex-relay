@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import asyncio
 import logging
+import time
 from typing import Any
 
 from homeassistant.components.media_player import (
@@ -22,6 +24,14 @@ from .const import DOMAIN
 from .helpers import RELAY_TO_HA_STATE, direct_url_from_proxy
 
 _LOGGER = logging.getLogger(__name__)
+
+# AlexxIT reports a track change as pause + play_media about a second apart
+# (the station says playing=false for a moment). Switching the room off for
+# that reset its volume to the Control4 turn-on level on every track (site
+# 2026-10-01: 25 % after "громче", 20 % on the next track). So a pause that is
+# not a person's is applied only if no new track came and the station still
+# does not play after this long.
+PAUSE_SETTLE = 2.5  # s
 
 HA_STATES = {
     "playing": MediaPlayerState.PLAYING,
@@ -80,6 +90,7 @@ class RelayRoomPlayer(MediaPlayerEntity):
         self._attr_volume_level = None
         self._station_volume_seen = False
         self._held_play: dict[str, Any] | None = None   # play_media ignored while paused
+        self._last_play = 0.0                           # monotonic time of the last /play
 
     async def async_added_to_hass(self) -> None:
         try:
@@ -160,6 +171,7 @@ class RelayRoomPlayer(MediaPlayerEntity):
             self._held_play = payload
             return
         self._held_play = None
+        self._last_play = time.monotonic()
         self._attr_media_image_url = meta.get("image") or None
         self._attr_media_duration = (meta.get("duration_ms") or 0) / 1000 or None
         await self._call(self._hub.client.play(payload))
@@ -178,10 +190,26 @@ class RelayRoomPlayer(MediaPlayerEntity):
         if resp.get("resume") == "restart" and station:
             await self._hub.station_call(station, "media_seek", {"seek_position": 0})
 
+    async def _track_change(self) -> bool:
+        """True when a pause from AlexxIT was only the gap between two tracks."""
+        if self._context is not None and self._context.user_id:
+            return False                        # a person pressed pause/stop
+        asked = time.monotonic()
+        await asyncio.sleep(PAUSE_SETTLE)
+        station = self._hub.station_for_room(self.room_id)
+        if self._last_play >= asked or (station and self._hub.station_playing(station)):
+            _LOGGER.debug("Room %s: pause was a track change, room kept on", self.room_id)
+            return True
+        return False
+
     async def async_media_pause(self) -> None:
+        if await self._track_change():
+            return
         await self._call(self._hub.client.pause(self.room_id))
 
     async def async_media_stop(self) -> None:
+        if await self._track_change():
+            return
         await self._call(self._hub.client.stop(self.room_id))
 
     async def async_media_next_track(self) -> None:
