@@ -92,6 +92,7 @@ class RelayHub:
         self._hook_failed: set[str] = set()
         self._station_volume: dict[str, float] = {}   # last volume seen in Glagol state
         self._playing: dict[str, bool] = {}           # last "playing" seen in Glagol state
+        self._dump_until: dict[str, float] = {}       # debug: full messages around a dialog
         # HA's copy of the driver's per-room volume settings (restored on re-add).
         self.store: Store = Store(hass, 1, f"{DOMAIN}.{entry.entry_id}")
         self.volume_cfg: dict = {}
@@ -215,6 +216,19 @@ class RelayHub:
             _LOGGER.debug("%s aliceState=%s volume=%s playing=%s", station, *key)
         if isinstance(state.get("playing"), bool):
             self._playing[station] = state["playing"]
+        # Diagnostic (debug log only): every message from Alice's wake-up until a
+        # few seconds after she is idle again, to see how a spoken command shows up
+        # when no vinsResponse comes (site 2026-10-01).
+        if _LOGGER.isEnabledFor(logging.DEBUG):
+            now = time.monotonic()
+            if state.get("aliceState") not in (None, "IDLE"):
+                self._dump_until[station] = now + 6
+            if now < self._dump_until.get(station, 0):
+                brief = {k: v for k, v in state.items() if k not in ("playerState", "hdmi")}
+                extra = {k: v for k, v in data.items() if k not in ("state", "vinsResponse")}
+                _LOGGER.debug("%s dialog msg state=%s extra=%s", station,
+                              json.dumps(brief, ensure_ascii=False)[:1200],
+                              json.dumps(extra, ensure_ascii=False)[:800])
         before = self._station_volume.get(station)
         vins = data.get("vinsResponse")
         if vins:
