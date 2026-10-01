@@ -261,7 +261,10 @@ class RelayHub:
                     _LOGGER.debug("%s: spoken volume command %s (volume %s, unmute %s)", station,
                                   command, state.get("volume"), dialog["unmute"])
                     self.hass.async_create_task(self.apply_volume_command(station, *command))
-            # after AlexxIT has taken the new level from this same message
+        if alice == "IDLE":
+            # After AlexxIT has taken the level from this same message. On every
+            # IDLE message: the station repeats "IDLE 0.1" after "громче", and a
+            # reset done only once was undone again (site 2026-10-01).
             self.hass.loop.call_soon(self.keep_unmute_level, station)
         if isinstance(state.get("volume"), (int, float)):
             self._station_volume[station] = float(state["volume"])

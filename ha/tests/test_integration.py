@@ -810,3 +810,28 @@ async def test_spoken_command_ignored_when_not_streaming(hass, aioclient_mock, r
         patcher.stop()
     assert calls_to(aioclient_mock, "/volume_step") == [] and calls_to(aioclient_mock, "/volume_level") == []
     assert fake._attr_volume_level == 0.6                     # not streaming: AlexxIT's level untouched
+
+
+async def test_unmute_level_kept_after_repeated_idle(hass, aioclient_mock, relay) -> None:
+    """Site 2026-10-01: "IDLE 0.1" came twice; AlexxIT took 0.1 again from the second."""
+    from types import SimpleNamespace
+    entry, station, _ = relay
+    set_station(hass, station, source="Control4 Офис", source_list=["Станция", "Control4 Офис"])
+    fake = SimpleNamespace(_attr_volume_level=0.4)
+
+    def alexxit(data):                       # AlexxIT remembers every non-zero level
+        vol = (data.get("state") or {}).get("volume")
+        if vol:
+            fake._attr_volume_level = vol
+
+    fake.glagol = SimpleNamespace(update_handler=alexxit)
+    hub = entry.runtime_data
+    with patch.object(hub, "_station_entity", return_value=fake):
+        hub.hook_stations()
+        for _ in range(2):                   # "громче", "громче"
+            for st, vol in [("LISTENING", 0.0), ("LISTENING", 0.4), ("IDLE", 0.1), ("IDLE", 0.1), ("IDLE", 0.0)]:
+                fake.glagol.update_handler(alice(st, vol))
+                await hass.async_block_till_done()
+    assert [c[2] for c in calls_to(aioclient_mock, "/volume_step")] == [
+        {"room_id": 21, "steps": 1}, {"room_id": 21, "steps": 1}]
+    assert fake._attr_volume_level == 0.4
