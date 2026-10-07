@@ -239,10 +239,18 @@ class RelayHub:
         alice = state.get("aliceState")
         dialog = self._dialog.get(station)
         if alice is not None and alice != "IDLE" and dialog is None:
-            dialog = self._dialog[station] = {"unmute": self.unmute_level(station), "handled": False}
+            dialog = self._dialog[station] = {"unmute": self.unmute_level(station), "handled": False,
+                                              "heard": False}
+        if dialog is not None and alice == "LISTENING":
+            dialog["heard"] = True      # someone spoke to the station
         before = self._station_volume.get(station)
         vins = data.get("vinsResponse")
         if vins:
+            # Spoken requests bring no vinsResponse any more: this dialog was
+            # started from HA (text command, TTS announcement), its end volume
+            # is not a voice command.
+            if dialog is not None:
+                dialog["handled"] = True
             directives = extract_directives(vins)
             _LOGGER.debug("%s directives=%s", station, json.dumps(directives, ensure_ascii=False))
             self.hass.bus.async_fire(EVENT_VINS, {"entity_id": station, "directives": directives})
@@ -255,7 +263,10 @@ class RelayHub:
         if alice == "IDLE" and dialog is not None:
             # Alice is done: a spoken command shows only in the station volume.
             self._dialog.pop(station, None)
-            if not dialog["handled"] and self.streaming(station):
+            # Only a dialog someone spoke into: an announcement (TTS) starts
+            # speaking without listening and ends at its own volume, which read
+            # as "громкость 5" and set the room to the middle (site 2026-10-07).
+            if dialog["heard"] and not dialog["handled"] and self.streaming(station):
                 command = classify_dialog_volume(state.get("volume"), dialog["unmute"])
                 if command:
                     _LOGGER.debug("%s: spoken volume command %s (volume %s, unmute %s)", station,

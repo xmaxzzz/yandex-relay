@@ -835,3 +835,24 @@ async def test_unmute_level_kept_after_repeated_idle(hass, aioclient_mock, relay
     assert [c[2] for c in calls_to(aioclient_mock, "/volume_step")] == [
         {"room_id": 21, "steps": 1}, {"room_id": 21, "steps": 1}]
     assert fake._attr_volume_level == 0.4
+
+
+async def test_announcement_does_not_change_room_volume(hass, aioclient_mock, relay) -> None:
+    """Site 2026-10-07: after a TTS announcement the room jumped to ~50 %."""
+    entry, station, _ = relay
+    set_station(hass, station, source="Control4 Офис", source_list=["Станция", "Control4 Офис"])
+    glagol, fake, patcher = hook_fake_station_with_level(entry.runtime_data, 0.4)
+    try:
+        # announcement with its own volume, no listening, no vinsResponse seen
+        for st, vol in [("BUSY", 0.5), ("SPEAKING", 0.5), ("IDLE", 0.5), ("IDLE", 0.0)]:
+            glagol.update_handler(alice(st, vol))
+        # announcement sent as a text command: vinsResponse with TTS only
+        glagol.update_handler(alice("BUSY", 0.4))
+        glagol.update_handler({"state": {"aliceState": "SPEAKING", "volume": 0.6, "playing": True},
+                               "vinsResponse": {"response": {"directives": [{"name": "tts_play_placeholder"}]}}})
+        glagol.update_handler(alice("IDLE", 0.6))
+        await hass.async_block_till_done()
+    finally:
+        patcher.stop()
+    assert calls_to(aioclient_mock, "/volume_step") == []
+    assert calls_to(aioclient_mock, "/volume_level") == []
