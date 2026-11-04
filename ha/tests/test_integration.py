@@ -23,6 +23,7 @@ from pytest_homeassistant_custom_component.common import MockConfigEntry
 
 from custom_components.c4_relay.const import (
     CONF_BINDINGS,
+    CONF_OUTPUTS,
     CONF_HA_URL,
     CONF_PAIRING_CODE,
     CONF_WEBHOOK_ID,
@@ -856,3 +857,87 @@ async def test_announcement_does_not_change_room_volume(hass, aioclient_mock, re
         patcher.stop()
     assert calls_to(aioclient_mock, "/volume_step") == []
     assert calls_to(aioclient_mock, "/volume_level") == []
+
+
+# --- direct output: the room's track also on a HA player (0.6.5) -------------------
+
+OUTPUT = "media_player.receiver"
+
+
+@pytest.fixture
+async def relay_out(hass: HomeAssistant, aioclient_mock):
+    """Like relay, with room 21 also played on OUTPUT; yields (entry, station, output calls)."""
+    from homeassistant.core import ServiceRegistry
+    mock_driver(aioclient_mock)
+    station = add_station(hass, media_title="Song", media_artist="Band", media_content_id="777")
+    entry = MockConfigEntry(
+        domain=DOMAIN, unique_id=f"{HOST}:{PORT}", title="Control4",
+        data={"host": HOST, "port": PORT, CONF_PAIRING_CODE: "ABCD1234",
+              CONF_HA_URL: "http://192.0.2.20:8123", CONF_WEBHOOK_ID: HOOK},
+        options={CONF_BINDINGS: {station: 21}, CONF_OUTPUTS: {"21": OUTPUT}},
+    )
+    entry.add_to_hass(hass)
+    out: list = []
+    original = ServiceRegistry.async_call
+
+    async def call(self, domain, service, service_data=None, *args, **kwargs):
+        if (service_data or {}).get("entity_id") == OUTPUT:
+            out.append((service, {k: v for k, v in service_data.items() if k != "entity_id"}))
+            return None
+        return await original(self, domain, service, service_data, *args, **kwargs)
+
+    async def record(self, entity_id, service, data=None):
+        pass
+
+    with patch("custom_components.c4_relay.RelayHub.station_call", record),             patch.object(ServiceRegistry, "async_call", call),             patch("custom_components.c4_relay.media_player.OUTPUT_DELAY", 0):
+        assert await hass.config_entries.async_setup(entry.entry_id)
+        await hass.async_block_till_done()
+        yield entry, station, out
+        await hass.config_entries.async_unload(entry.entry_id)
+        await hass.async_block_till_done()
+
+
+async def test_output_gets_the_track_and_control4_session_stays(hass, aioclient_mock, relay_out) -> None:
+    entry, _, out = relay_out
+    direct = "https://s1.storage.yandex.net/get-mp3/x/y/z.mp3"
+    await play_media(hass, entry, direct)
+    assert out == [("play_media", {"media_content_id": direct, "media_content_type": "music"})]
+    assert len(calls_to(aioclient_mock, "/play")) == 1          # Control4 session as before
+
+
+async def test_output_follows_pause_stop_and_restart(hass, aioclient_mock, relay_out, hass_admin_user) -> None:
+    from homeassistant.core import Context
+    entry, _, out = relay_out
+    user = Context(user_id=hass_admin_user.id)
+    direct = "https://s1.storage.yandex.net/get-mp3/x/y/z.mp3"
+    await play_media(hass, entry, direct)
+    pid = player_id(hass, entry)
+    await hass.services.async_call("media_player", "media_pause", {"entity_id": pid}, blocking=True, context=user)
+    aioclient_mock.clear_requests()
+    aioclient_mock.post(f"{BASE}/resume", json={"room_id": 21, "state": "starting", "resume": "restart"})
+    mock_driver(aioclient_mock)
+    await hass.services.async_call("media_player", "media_play", {"entity_id": pid}, blocking=True)
+    await hass.services.async_call("media_player", "media_stop", {"entity_id": pid}, blocking=True, context=user)
+    assert [s for s, _ in out] == ["play_media", "media_pause", "play_media", "media_stop"]
+    assert out[2][1]["media_content_id"] == direct              # restart = the same track again
+
+
+async def test_no_output_no_calls(hass, aioclient_mock, relay) -> None:
+    entry, _, _ = relay
+    assert entry.runtime_data.outputs == {}
+    await play_media(hass, entry)
+    assert len(calls_to(aioclient_mock, "/play")) == 1
+
+
+async def test_options_flow_sets_room_output(hass, aioclient_mock, relay) -> None:
+    entry, station, _ = relay
+    r = await hass.config_entries.options.async_init(entry.entry_id)
+    assert r["step_id"] == "init"
+    key = next(iter(r["data_schema"].schema))
+    r = await hass.config_entries.options.async_configure(r["flow_id"], {str(key): "21"})
+    assert r["step_id"] == "outputs"
+    room_key = next(iter(r["data_schema"].schema))
+    assert str(room_key) == "Офис"
+    r = await hass.config_entries.options.async_configure(r["flow_id"], {"Офис": OUTPUT})
+    assert r["type"] is FlowResultType.CREATE_ENTRY
+    assert entry.options == {CONF_BINDINGS: {station: 21}, CONF_OUTPUTS: {"21": OUTPUT}}

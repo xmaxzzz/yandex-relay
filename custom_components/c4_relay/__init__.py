@@ -39,6 +39,7 @@ from homeassistant.helpers.event import (
 from .api import RelayAuthError, RelayClient, RelayError
 from .const import (
     CONF_BINDINGS,
+    CONF_OUTPUTS,
     CONF_HA_URL,
     CONF_PAIRING_CODE,
     CONF_WEBHOOK_ID,
@@ -89,6 +90,9 @@ class RelayHub:
         self.rooms: dict[int, str] = {int(r["id"]): r["name"] for r in rooms}
         self.bindings: dict[str, int] = {
             station: int(room) for station, room in entry.options.get(CONF_BINDINGS, {}).items()
+        }
+        self.outputs: dict[int, str] = {
+            int(room): entity for room, entity in entry.options.get(CONF_OUTPUTS, {}).items() if entity
         }
         self.players: dict[int, RelayRoomPlayer] = {}
         self.switches: dict[str, RelayEnabledSwitch] = {}

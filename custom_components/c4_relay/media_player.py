@@ -33,6 +33,12 @@ _LOGGER = logging.getLogger(__name__)
 # does not play after this long.
 PAUSE_SETTLE = 2.5  # s
 
+# A room's direct output gets the track this long after Control4 started the
+# room: Control4 switches the receiver to the input of its own audio path, and
+# the network input has to win afterwards (an AV receiver turns to its network
+# input when that starts playing).
+OUTPUT_DELAY = 1.5  # s
+
 HA_STATES = {
     "playing": MediaPlayerState.PLAYING,
     "paused": MediaPlayerState.PAUSED,
@@ -91,6 +97,7 @@ class RelayRoomPlayer(MediaPlayerEntity):
         self._station_volume_seen = False
         self._held_play: dict[str, Any] | None = None   # play_media ignored while paused
         self._last_play = 0.0                           # monotonic time of the last /play
+        self._output_url: str | None = None             # last track sent to the direct output
 
     async def async_added_to_hass(self) -> None:
         try:
@@ -174,7 +181,10 @@ class RelayRoomPlayer(MediaPlayerEntity):
         self._last_play = time.monotonic()
         self._attr_media_image_url = meta.get("image") or None
         self._attr_media_duration = (meta.get("duration_ms") or 0) / 1000 or None
-        await self._call(self._hub.client.play(payload))
+        try:
+            await self._call(self._hub.client.play(payload))
+        finally:
+            await self._output_play(payload)
 
     async def async_media_play(self) -> None:
         # The station resumed. After a pause the room was switched off, so the
@@ -182,13 +192,21 @@ class RelayRoomPlayer(MediaPlayerEntity):
         station = self._hub.station_for_room(self.room_id)
         if self._held_play is not None:           # the track AlexxIT sent while paused
             payload, self._held_play = self._held_play, None
-            await self._call(self._hub.client.play(payload))
+            try:
+                await self._call(self._hub.client.play(payload))
+            finally:
+                await self._output_play(payload)
             if station:
                 await self._hub.station_call(station, "media_seek", {"seek_position": 0})
             return
         resp = await self._call(self._hub.client.resume(self.room_id))
-        if resp.get("resume") == "restart" and station:
-            await self._hub.station_call(station, "media_seek", {"seek_position": 0})
+        if resp.get("resume") == "restart":
+            if self._output_url:
+                await self._output_play({"url": self._output_url})
+            if station:
+                await self._hub.station_call(station, "media_seek", {"seek_position": 0})
+        else:
+            await self._output_call("media_play")
 
     async def _track_change(self) -> bool:
         """True when a pause from AlexxIT was only the gap between two tracks."""
@@ -205,12 +223,38 @@ class RelayRoomPlayer(MediaPlayerEntity):
     async def async_media_pause(self) -> None:
         if await self._track_change():
             return
+        await self._output_call("media_pause")
         await self._call(self._hub.client.pause(self.room_id))
 
     async def async_media_stop(self) -> None:
         if await self._track_change():
             return
+        await self._output_call("media_stop")
         await self._call(self._hub.client.stop(self.room_id))
+
+    # --- direct output -----------------------------------------------------
+    # A room can have a HA media_player as its direct output (options): the same
+    # track goes there too, so the room sounds even when its Control4 audio path
+    # does not reach the speakers (e.g. an AV receiver played over its network
+    # input). The Control4 session (panel, now playing, volume) stays as is.
+    async def _output_call(self, service: str, data: dict[str, Any] | None = None) -> None:
+        output = self._hub.outputs.get(self.room_id)
+        if not output:
+            return
+        try:
+            await self.hass.services.async_call(
+                "media_player", service, {"entity_id": output, **(data or {})}, blocking=False,
+            )
+        except Exception as err:  # noqa: BLE001 - the Control4 room goes on regardless
+            _LOGGER.warning("Room %s: %s on %s failed: %s", self.room_id, service, output, err)
+
+    async def _output_play(self, payload: dict[str, Any]) -> None:
+        url = payload.get("url") or payload.get("fallback_url")
+        if not url or not self._hub.outputs.get(self.room_id):
+            return
+        self._output_url = url
+        await asyncio.sleep(OUTPUT_DELAY)
+        await self._output_call("play_media", {"media_content_id": url, "media_content_type": "music"})
 
     async def async_media_next_track(self) -> None:
         if station := self._hub.station_for_room(self.room_id):
