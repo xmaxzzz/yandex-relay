@@ -940,4 +940,6 @@ async def test_options_flow_sets_room_output(hass, aioclient_mock, relay) -> Non
     assert str(room_key) == "Офис"
     r = await hass.config_entries.options.async_configure(r["flow_id"], {"Офис": OUTPUT})
     assert r["type"] is FlowResultType.CREATE_ENTRY
+    await hass.async_block_till_done()                # the entry reloads with the new options
+    assert entry.runtime_data.outputs == {21: OUTPUT}
     assert entry.options == {CONF_BINDINGS: {station: 21}, CONF_OUTPUTS: {"21": OUTPUT}}
