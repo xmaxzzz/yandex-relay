@@ -7,6 +7,7 @@ recorded instead of executed.
 
 from __future__ import annotations
 
+import asyncio
 import base64
 import json
 from unittest.mock import patch
@@ -892,7 +893,7 @@ async def relay_out(hass: HomeAssistant, aioclient_mock):
     async def record(self, entity_id, service, data=None):
         pass
 
-    with patch("custom_components.c4_relay.RelayHub.station_call", record),             patch.object(ServiceRegistry, "async_call", call),             patch("custom_components.c4_relay.media_player.OUTPUT_DELAY", 0):
+    with patch("custom_components.c4_relay.RelayHub.station_call", record),             patch.object(ServiceRegistry, "async_call", call),             patch("custom_components.c4_relay.media_player.OUTPUT_DELAY", 0),          patch("custom_components.c4_relay.media_player.OUTPUT_CHECKS", (0.01, 0.02, 0.03)):
         assert await hass.config_entries.async_setup(entry.entry_id)
         await hass.async_block_till_done()
         yield entry, station, out
@@ -923,6 +924,39 @@ async def test_output_follows_pause_stop_and_restart(hass, aioclient_mock, relay
     await hass.services.async_call("media_player", "media_stop", {"entity_id": pid}, blocking=True, context=user)
     assert [s for s, _ in out] == ["play_media", "media_pause", "play_media", "media_stop"]
     assert out[2][1]["media_content_id"] == direct              # restart = the same track again
+
+
+async def test_output_gets_the_track_again_when_it_stops(hass, aioclient_mock, relay_out) -> None:
+    """Control4 put the receiver back on its own input after HEOS started (2026-11-26)."""
+    entry, _, out = relay_out
+    hass.states.async_set(OUTPUT, "idle")
+    direct = "https://s1.storage.yandex.net/get-mp3/x/y/z.mp3"
+    await play_media(hass, entry, direct)
+    await asyncio.sleep(0.1)
+    await hass.async_block_till_done()
+    assert [s for s, _ in out] == ["play_media"] * 3          # first + OUTPUT_RETRIES
+    assert all(d["media_content_id"] == direct for _, d in out)
+
+
+async def test_output_playing_is_left_alone(hass, aioclient_mock, relay_out) -> None:
+    entry, _, out = relay_out
+    hass.states.async_set(OUTPUT, "playing")
+    await play_media(hass, entry)
+    await asyncio.sleep(0.1)
+    await hass.async_block_till_done()
+    assert [s for s, _ in out] == ["play_media"]
+
+
+async def test_output_check_stops_with_pause(hass, aioclient_mock, relay_out, hass_admin_user) -> None:
+    from homeassistant.core import Context
+    entry, _, out = relay_out
+    hass.states.async_set(OUTPUT, "idle")
+    await play_media(hass, entry)
+    await hass.services.async_call("media_player", "media_pause", {"entity_id": player_id(hass, entry)},
+                                   blocking=True, context=Context(user_id=hass_admin_user.id))
+    await asyncio.sleep(0.1)
+    await hass.async_block_till_done()
+    assert [s for s, _ in out] == ["play_media", "media_pause"]
 
 
 async def test_no_output_no_calls(hass, aioclient_mock, relay) -> None:

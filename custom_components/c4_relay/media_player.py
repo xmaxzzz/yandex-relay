@@ -39,6 +39,15 @@ PAUSE_SETTLE = 2.5  # s
 # input when that starts playing).
 OUTPUT_DELAY = 1.5  # s
 
+# Control4 may switch the receiver back to its own input later than that: a
+# room added to the session by programming re-selects the path (site
+# 2026-11-26: Беседка switched on, Denon took HEOS at +5 s, adding Кухня put it
+# back on DVD at +7 s and HEOS stopped). So the output is checked at these
+# times after the track was sent and gets the track again if it is not playing.
+OUTPUT_CHECKS = (10.0, 20.0, 30.0)  # s after the track was sent
+OUTPUT_RETRIES = 2
+OUTPUT_OK_STATES = {"playing", "buffering"}
+
 HA_STATES = {
     "playing": MediaPlayerState.PLAYING,
     "paused": MediaPlayerState.PAUSED,
@@ -98,12 +107,16 @@ class RelayRoomPlayer(MediaPlayerEntity):
         self._held_play: dict[str, Any] | None = None   # play_media ignored while paused
         self._last_play = 0.0                           # monotonic time of the last /play
         self._output_url: str | None = None             # last track sent to the direct output
+        self._output_watch: asyncio.Task | None = None  # re-sends the track if the output stops
 
     async def async_added_to_hass(self) -> None:
         try:
             self._apply(await self._hub.client.state(self.room_id))
         except RelayError as err:
             _LOGGER.debug("initial state for room %s: %s", self.room_id, err)
+
+    async def async_will_remove_from_hass(self) -> None:
+        self._stop_output_watch()
 
     # --- state from the driver ------------------------------------------
     def set_relay_state(self, relay_state: str | None) -> None:
@@ -241,6 +254,8 @@ class RelayRoomPlayer(MediaPlayerEntity):
         output = self._hub.outputs.get(self.room_id)
         if not output:
             return
+        if service != "play_media":
+            self._stop_output_watch()               # pause/stop: the output may stop now
         try:
             await self.hass.services.async_call(
                 "media_player", service, {"entity_id": output, **(data or {})}, blocking=False,
@@ -253,8 +268,38 @@ class RelayRoomPlayer(MediaPlayerEntity):
         if not url or not self._hub.outputs.get(self.room_id):
             return
         self._output_url = url
+        self._stop_output_watch()
         await asyncio.sleep(OUTPUT_DELAY)
         await self._output_call("play_media", {"media_content_id": url, "media_content_type": "music"})
+        self._output_watch = self.hass.async_create_background_task(
+            self._watch_output(url), f"c4_relay output watch room {self.room_id}")
+
+    def _stop_output_watch(self) -> None:
+        if self._output_watch is not None and not self._output_watch.done():
+            if self._output_watch is not asyncio.current_task():
+                self._output_watch.cancel()
+        self._output_watch = None
+
+    async def _watch_output(self, url: str) -> None:
+        """Send the track again while the output is not playing it (see OUTPUT_CHECKS)."""
+        output = self._hub.outputs.get(self.room_id)
+        retries = 0
+        waited = 0.0
+        for at in OUTPUT_CHECKS:
+            await asyncio.sleep(at - waited)
+            waited = at
+            if self._output_url != url or self._attr_state != MediaPlayerState.PLAYING or not output:
+                return                              # another track, or the room stopped
+            st = self.hass.states.get(output)
+            if st is None or st.state in OUTPUT_OK_STATES:
+                continue
+            if retries >= OUTPUT_RETRIES:
+                _LOGGER.warning("Room %s: %s still %s, the track is not sent again", self.room_id, output, st.state)
+                return
+            retries += 1
+            _LOGGER.info("Room %s: %s is %s %.0f s after the track, sending it again", self.room_id,
+                         output, st.state, at)
+            await self._output_call("play_media", {"media_content_id": url, "media_content_type": "music"})
 
     async def async_media_next_track(self) -> None:
         if station := self._hub.station_for_room(self.room_id):
