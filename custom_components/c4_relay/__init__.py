@@ -78,6 +78,23 @@ UNREACHABLE_ISSUE_AFTER = 300  # s the driver is unreachable before a Repairs is
 REAUTH_AFTER = 600             # s of a rejected code before the reauth flow starts
 
 
+def drop_null_player_state(data: Any) -> Any:
+    """Remove "playerState": null from a Glagol message before AlexxIT sees it.
+
+    Station firmware 0.376 (Mini 2 from 2026-11-18, Mini 3 Pro) reports an idle
+    player as null. AlexxIT 3.22.3 checks only that the key exists when a
+    station plays to another media_player (our Control4 room) and then reads
+    player_state["id"]: TypeError, the local connection drops, the station
+    falls back to the cloud and loses its source list. Without the key AlexxIT
+    takes its usual "nothing loaded" path.
+    """
+    if isinstance(data, dict):
+        state = data.get("state")
+        if isinstance(state, dict) and "playerState" in state and state["playerState"] is None:
+            del state["playerState"]
+    return data
+
+
 class RelayHub:
     """Everything one config entry (one Relay driver) needs at runtime."""
 
@@ -155,6 +172,9 @@ class RelayHub:
         async_set_state). We wrap that callable and pass everything through
         unchanged; the wrapper only looks at the message. Re-run periodically:
         AlexxIT creates a new Glagol client when the station reconnects.
+
+        One exception: a null "playerState" is dropped before AlexxIT sees it
+        (see drop_null_player_state).
         """
         for station in self.bindings:
             ent = self._station_entity(station)
@@ -174,7 +194,7 @@ class RelayHub:
                     hub.on_glagol_message(_station, data)
                 except Exception:  # never break AlexxIT because of us
                     _LOGGER.exception("c4_relay Glagol hook failed")
-                return _original(data)
+                return _original(drop_null_player_state(data))
 
             wrapper._c4_relay_hook = True
             glagol.update_handler = wrapper

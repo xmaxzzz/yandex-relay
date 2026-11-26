@@ -350,6 +350,9 @@ async def test_glagol_hook_passes_messages_and_reports_directives(hass, relay) -
                               "directives": [{"name": "sound_louder", "payload": None}]}
     glagol.update_handler(None)                      # disconnect notification passes through
     assert seen[-1] is None
+    # firmware 0.376: idle player reported as null -> key dropped for AlexxIT
+    glagol.update_handler({"state": {"playing": False, "playerState": None, "volume": 0.3}})
+    assert seen[-1] == {"state": {"playing": False, "volume": 0.3}}
 
 
 async def test_glagol_hook_survives_missing_alexxit(hass, relay) -> None:
