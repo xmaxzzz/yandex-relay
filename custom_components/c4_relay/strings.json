@@ -40,6 +40,10 @@
       "init": {
         "title": "Stations and rooms",
         "description": "Pick the Control4 room each Yandex Station streams its music to."
+      },
+      "outputs": {
+        "title": "Direct output",
+        "description": "Optional. For a room whose Control4 audio does not reach the speakers, pick a Home Assistant player (for example an AV receiver over its network input): the room's music is also played on it, while the Control4 session (panel, now playing, volume) stays. Leave empty to play through Control4 only."
       }
     },
     "abort": {

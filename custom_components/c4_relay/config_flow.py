@@ -21,6 +21,7 @@ from homeassistant.helpers.network import NoURLAvailableError, get_url
 from .api import RelayAuthError, RelayClient, RelayError
 from .const import (
     CONF_BINDINGS,
+    CONF_OUTPUTS,
     CONF_HA_URL,
     CONF_PAIRING_CODE,
     CONF_WEBHOOK_ID,
@@ -80,6 +81,34 @@ def parse_bindings(user_input: Mapping[str, Any], key_to_entity: Mapping[str, st
         if key in key_to_entity and value != NO_ROOM and int(value) in known:
             out[key_to_entity[key]] = int(value)
     return out
+
+
+def outputs_schema(hass: HomeAssistant, rooms: list[dict], bindings: Mapping[str, int],
+                   current: Mapping[int, str]) -> tuple[vol.Schema, dict[str, int]]:
+    """One optional media_player per bound room: its direct output. Keys are
+    room names (labels); the returned map turns them back into room ids."""
+    names = {int(r["id"]): r["name"] for r in rooms}
+    own = [e.entity_id for e in er.async_get(hass).entities.values()
+           if e.platform == DOMAIN and e.domain == "media_player"]
+    player = selector.EntitySelector(
+        selector.EntitySelectorConfig(domain="media_player", exclude_entities=own)
+    )
+    fields: dict = {}
+    key_to_room: dict[str, int] = {}
+    for room in sorted(set(bindings.values())):
+        key = names.get(room, str(room))
+        if key in key_to_room:
+            key = f"{key} ({room})"
+        key_to_room[key] = room
+        if current.get(room):
+            fields[vol.Optional(key, description={"suggested_value": current[room]})] = player
+        else:
+            fields[vol.Optional(key)] = player
+    return vol.Schema(fields), key_to_room
+
+
+def parse_outputs(user_input: Mapping[str, Any], key_to_room: Mapping[str, int]) -> dict[str, str]:
+    return {str(room): user_input[key] for key, room in key_to_room.items() if user_input.get(key)}
 
 
 def default_ha_url(hass: HomeAssistant) -> str:
@@ -186,13 +215,16 @@ class RelayOptionsFlow(OptionsFlow):
     def __init__(self) -> None:
         self._rooms: list[dict] = []
         self._keys: dict[str, str] = {}
+        self._bindings: dict[str, int] = {}
+        self._room_keys: dict[str, int] = {}
 
     async def async_step_init(self, user_input: dict[str, Any] | None = None) -> ConfigFlowResult:
         entry = self.config_entry
         if user_input is not None:
-            return self.async_create_entry(
-                data={CONF_BINDINGS: parse_bindings(user_input, self._keys, self._rooms)}
-            )
+            self._bindings = parse_bindings(user_input, self._keys, self._rooms)
+            if not self._bindings:
+                return self.async_create_entry(data={CONF_BINDINGS: {}, CONF_OUTPUTS: {}})
+            return await self.async_step_outputs()
         _info, self._rooms, err = await _check(
             self.hass, entry.data[CONF_HOST], entry.data[CONF_PORT], entry.data[CONF_PAIRING_CODE]
         )
@@ -204,3 +236,14 @@ class RelayOptionsFlow(OptionsFlow):
         current = {k: int(v) for k, v in entry.options.get(CONF_BINDINGS, {}).items()}
         schema, self._keys = bind_schema(stations, self._rooms, current)
         return self.async_show_form(step_id="init", data_schema=schema)
+
+    async def async_step_outputs(self, user_input: dict[str, Any] | None = None) -> ConfigFlowResult:
+        """Optional direct output (a HA media_player) for each bound room."""
+        if user_input is not None:
+            return self.async_create_entry(data={
+                CONF_BINDINGS: self._bindings,
+                CONF_OUTPUTS: parse_outputs(user_input, self._room_keys),
+            })
+        current = {int(r): e for r, e in self.config_entry.options.get(CONF_OUTPUTS, {}).items()}
+        schema, self._room_keys = outputs_schema(self.hass, self._rooms, self._bindings, current)
+        return self.async_show_form(step_id="outputs", data_schema=schema)
